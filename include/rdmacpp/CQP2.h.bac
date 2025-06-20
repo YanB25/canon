@@ -1,0 +1,141 @@
+// Concurrent QP
+#pragma once
+
+#include <infiniband/verbs.h>
+#include <infiniband/verbs_exp.h>
+
+#include <atomic>
+
+#include "CoroContext.h"
+#include "Pool.h"
+#include "WRCtx.h"
+#include "util/ASM.h"
+#include "util/History.h"
+#include "util/Pre.h"
+#include "util/TLS.h"
+#include "util/lock/Guard.h"
+
+// struct ORecord
+// {
+//     void *wrctx;
+//     std::atomic<bool> *ready;
+//     size_t coro_id;
+// };
+// inline std::ostream &operator<<(std::ostream &os, const ORecord &r)
+// {
+//     os << "{cid: " << r.coro_id << *(rdma::WRCtx<int> *) r.wrctx
+//        << ", ready: " << r.ready->load() << "}";
+//     return os;
+// }
+
+namespace rdma
+{
+class CQP2
+{
+public:
+    using WRCtxT = WRCtx<int>;
+    CQP2(ibv_qp *qp, ibv_cq *cq) : qp_(qp), cq_(cq)
+    {
+    }
+
+    void write(const void *source,
+               uint32_t lkey,
+               size_t size,
+               uint64_t dest,
+               uint32_t rkey,
+               CoroContext *ctx)
+    {
+        {
+            auto *wrctx = new WRCtxT(util::get_thread_id(), ctx);
+
+            auto &wr = wrctx->wr(0);
+            auto &sge = wrctx->sge(0);
+
+            memset(&wr, 0, sizeof(wr));
+            if (size)
+            {
+                memset(&sge, 0, sizeof(sge));
+                sge.addr = (uint64_t) source;
+                sge.length = size;
+                sge.lkey = lkey;
+                wr.sg_list = &sge;
+                wr.num_sge = 1;
+            }
+
+            wr.exp_opcode = IBV_EXP_WR_RDMA_WRITE;
+            // must be signal, since it is concurrent queues
+            wr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+            wr.wr.rdma.remote_addr = dest;
+            wr.wr.rdma.rkey = rkey;
+            wr.wr_id = (uint64_t) wrctx;
+            wr.next = nullptr;
+
+            link_wr(&wr);
+            wr_nr_++;
+        }
+
+        ctx->wait_yield_to_master();
+    }
+
+    void link_wr(ibv_exp_send_wr *wr)
+    {
+        util::UniqueGuard<util::RWLock> read_guard(lock_);
+
+        ibv_exp_send_wr *cur = cur_wr_.load(std::memory_order_relaxed);
+        if (unlikely(cur == nullptr))
+        {
+            head_wr_ = wr;
+            cur_wr_ = wr;
+            return;
+        }
+
+        while (cur->next != nullptr)
+        {
+            cur = cur->next;
+        }
+        cur->next = wr;
+        cur_wr_ = wr;
+    }
+    void commit()
+    {
+        util::UniqueGuard<util::RWLock> guard(lock_);
+        // CAS is not needed: only one committer
+        auto *head = head_wr_.load(std::memory_order_relaxed);
+        if (unlikely(head == nullptr))
+        {
+            return;
+        }
+
+        ibv_exp_send_wr *bad_wr{};
+        wr_nr_ = 0;
+        auto ret = ibv_exp_post_send(qp_, DCHECK_NOTNULL(head), &bad_wr);
+
+        PLOG_IF(FATAL, ret != 0)
+            << "** failed to ibv_post_send. bad: " << *bad_wr;
+
+        head_wr_ = nullptr;
+        cur_wr_ = nullptr;
+    }
+    ibv_cq *cq()
+    {
+        return cq_;
+    }
+    ibv_qp *qp()
+    {
+        return qp_;
+    }
+    std::atomic<ibv_exp_send_wr *> &head()
+    {
+        return head_wr_;
+    }
+
+private:
+    ibv_qp *qp_{};
+    ibv_cq *cq_{};
+
+    std::atomic<ibv_exp_send_wr *> head_wr_{};
+    std::atomic<ibv_exp_send_wr *> cur_wr_{};
+    size_t wr_nr_{};
+    util::RWLock lock_;
+};
+}  // namespace rdma

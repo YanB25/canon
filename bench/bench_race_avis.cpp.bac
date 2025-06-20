@@ -1,0 +1,525 @@
+#include <numa.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <thread>
+
+#include "Common.h"
+#include "DSMAdaptor.h"
+#include "DSMCache.h"
+#include "PerThread.h"
+#include "WRLock.h"
+#include "avis/AvisAdaptor.h"
+#include "avis/avis.h"
+#include "bench/DataFrame.h"
+#include "bench/experiment.h"
+#include "gflags/gflags.h"
+#include "glog/logging.h"
+#include "memory/dsm_allocator.h"
+#include "patronus/RdmaAdaptor.h"
+#include "range/v3/functional/comparisons.hpp"
+#include "range/v3/view.hpp"
+#include "rdmacpp/QP_Debug.h"
+#include "thirdparty/racehashing/race.h"
+#include "util/Tracer.h"
+#include "util/gflags_def.h"
+
+using namespace patronus::hash;
+
+using HashKey = ::hash::HashKey;
+
+using RaceHashingT = RaceHashing<4, 512, 8>;
+using HandleT = typename RaceHashingT::Handle;
+
+struct PCLS
+{
+    HandleT::pointer handle;
+    avis::AvisHandle::Pointer avis_handle;
+};
+
+struct Spec
+{
+    using PCLS = PCLS;
+};
+
+class Experiment : public ::bench::DSMCoroExperiment<Spec>
+{
+public:
+    using Base = ::bench::DSMCoroExperiment<Spec>;
+    using BLS = typename Base::BLS;
+    using Provider = avis::AvisHandle::Provider;
+
+    Experiment(const avis::Config &avis_config) : avis_config_(avis_config)
+    {
+        DSMConfig dsm_config;
+        dsm_config.worker_nr = 0;
+        dsm_ = DSM::getInstance(dsm_config);
+        dsm_->registerThread();
+
+        server_nid_ = dsm_->getClusterSize() - 1;
+    }
+    bool is_client() const
+    {
+        // return dsm_->get_node_id() != server_nid_;
+        return dsm_->get_node_id() == 0;
+    }
+    bool is_server() const
+    {
+        return dsm_->get_node_id() == server_nid_;
+    }
+
+    void set_handle(BLS &bls /* out */,
+                    CoroContext *ctx,
+                    const avis::Policy &policy)
+    {
+        auto &pcls = bls.persistent_coroutine();
+        if (is_client())
+        {
+            pcls.avis_handle = avis::AvisHandle::make_ptr(
+                dsm_,
+                avis_config_,
+                std::vector<Provider>{avis_provider_},
+                policy,
+                ctx);
+            pcls.avis_handle->update_metas();
+
+            auto race_handle_conf = RaceHashingConfigFactory::get_unprotected(
+                "test", false /* force match */);
+            auto race_avis_adaptor = avis::AvisAdaptor::make_ptr(
+                pcls.avis_handle, nullptr /* manager */);
+            pcls.handle = HandleT::new_instance(race_meta_raddr_,
+                                                race_handle_conf,
+                                                false /* auto expand */,
+                                                race_avis_adaptor);
+            pcls.handle->init();
+        }
+    }
+    void init_server()
+    {
+        CHECK(is_server());
+        // init server avis
+        auto provider_id = dsm_->get_node_id();
+        auto primary_alloc = dsm_->get_dsm_allocator();
+        auto secondary_alloc = dsm_->get_secondary_allocator();
+        LOG_IF(INFO, avis_manager_) << "[debug] !!! " << PRE(avis_manager_);
+
+        avis_manager_ = avis::AvisManager::make_ptr(provider_id,
+                                                    primary_alloc,
+                                                    secondary_alloc,
+                                                    dsm_,
+                                                    avis_config_,
+                                                    1 /* init pool nr */);
+        Provider provider{
+            .node_id = (uint32_t) dsm_->get_node_id(),
+            .rkey = dsm_->get_base_rkey(0 /* dir_id */),
+            .meta_addr = (uint64_t) avis_manager_->meta_addr(),
+        };
+        dsm_->put("avis:provider", provider, 100ms);
+
+        // init server RACE
+        race_conf_.initial_subtable = 4;
+        // deprecated for Avis
+        race_conf_.g_kvblock_pool_addr = nullptr;
+        race_conf_.g_kvblock_pool_size = 0;
+
+        auto server_adaptor =
+            avis::AvisAdaptor::make_ptr(nullptr, avis_manager_);
+        auto server_allocator = server_adaptor->get_manager_allocator();
+        table_ = RaceHashingT::new_instance(
+            server_adaptor, server_allocator, race_conf_);
+        auto meta_raddr = table_->meta_raddr();
+        dsm_->put("race:meta_raddr", meta_raddr, 100ms);
+        LOG(INFO) << "PUT: " << PRE(meta_raddr);
+        LOG(INFO) << PRE(avis_manager_);
+    }
+
+    void thread_init(BLS &bls, size_t thread_nr) override
+    {
+        dsm_->registerThread();
+        Base::thread_init(bls, thread_nr);
+    }
+    DSM::pointer get_dsm() const override
+    {
+        return dsm_;
+    }
+    void on_start_bench(BLS &bls, const Config &conf) override
+    {
+        static int epoch_ = 0;
+        if (is_server())
+        {
+            init_server();
+        }
+
+        dsm_->keeper_barrier("epoch-" + std::to_string(epoch_++), 100ms);
+
+        avis_provider_ = dsm_->get<Provider>("avis:provider", 100ms);
+        race_meta_raddr_ = dsm_->get<GlobalAddress>("race:meta_raddr", 100ms);
+        LOG(INFO) << "GET: " << PRE(avis_provider_) << ", "
+                  << PRE(race_meta_raddr_);
+        CHECK(!race_meta_raddr_.is_null());
+
+        Base::on_start_bench(bls, conf);
+    }
+
+    void on_thread_end_bench(BLS &bls, const Config &conf) override
+    {
+        Base::on_thread_end_bench(bls, conf);
+    }
+
+    void exit() override
+    {
+        df_.dump(FLAGS_binary, FLAGS_exec_meta);
+    }
+
+    void benchmark_coroutine(BLS &bls,
+                             const Config &conf,
+                             CoroContext &ctx,
+                             ::bench::StopToken::pointer token,
+                             bool) override
+    {
+        auto &pcls = bls.persistent_coroutine();
+
+        auto kv_size = conf.get<size_t>("kv_size");
+        auto key_rng = conf.get<size_t>("key_rng");
+        auto get_ratio = conf.get<size_t>("get_ratio");
+        auto delete_ratio = conf.get<size_t>("delete_ratio");
+        auto avis_policy = conf.get<avis::Policy>("avis_policy");
+
+        CHECK(dsm_->hasRegistered());
+
+        std::unordered_map<std::string, std::string> kvs;
+
+        std::string key(sizeof(HashKey), ' ');
+        HashKey &hkey = *(HashKey *) key.data();
+        hkey.nid = dsm_->get_node_id();
+        hkey.tid = dsm_->get_thread_id();
+        hkey.cid = ctx.coro_id();
+        std::string value(16, 'a');
+
+        size_t value_size = KVBlockView::kvblock_fit_value(kv_size, key.size());
+
+        util::TraceManager tm;
+
+        if (is_client())
+        {
+            set_handle(bls, &ctx, avis_policy);
+        }
+
+        while (!token->stop_requested())
+        {
+            if (!is_client())
+            {
+                continue;
+            }
+
+            hkey.value = fast_pseudo_rand_int(key_rng - 1);
+            fast_pseudo_fill_buf(value.data(), value.size());
+
+            bool is_get = fast_pseudo_bool_with_prob(get_ratio / 100.0);
+            bool is_delete = fast_pseudo_bool_with_prob(delete_ratio / 100.0);
+
+            if (is_get)
+            {
+                BufferView get_v;
+                // auto trace = tm.trace("get");
+                // trace.set("key", key);
+                // auto rc = handle->get(key, get_v, trace);
+                if constexpr (kEnableHistory)
+                {
+                    ::hash::history.current().add(Record{
+                        .ma = kEvent,
+                        .ua = kRead,
+                        .raddr = GlobalAddress{},
+                        .key = hkey,
+                    });
+                }
+                auto view = pcls.handle->prepare_kv(key.size(), 0);
+                view.fill_key(key);
+
+                auto rc = pcls.handle->get(get_v);
+                if constexpr (kEnableHistory)
+                {
+                    ::hash::history.current().add(Record{
+                        .ma = kEvent,
+                        .ua = kRead,
+                        .raddr = GlobalAddress(0, (uintptr_t) 0xff),
+                        .key = hkey,
+                    });
+                }
+                if (kvs.count(key))
+                {
+                    if (unlikely(rc != RC::kOk || get_v.to_sv() != kvs[key]))
+                    {
+                        LOG(ERROR) << "expect " << PRE(RC::kOk) << ", got "
+                                   << PRE(rc) << ", expect " << PRE(kvs[key])
+                                   << ", got " << PRE(get_v);
+                        enter_error(bls, token, key, hkey);
+                    }
+                }
+                else
+                {
+                    CHECK_EQ(rc, RC::kNotFound)
+                        << PRE(ctx, key, hkey, value, get_v);
+                }
+            }
+            else if (is_delete)
+            {
+                auto view = pcls.handle->prepare_kv(key.size(), 0);
+                view.fill_key(key);
+
+                auto rc = pcls.handle->del();
+                if (kvs.count(key))
+                {
+                    CHECK_EQ(rc, RC::kOk);
+                    kvs.erase(key);
+                }
+                else
+                {
+                    CHECK_EQ(rc, RC::kNotFound);
+                }
+            }
+            else
+            {
+                // auto trace = tm.trace("put");
+                // trace.set("key", key);
+                // handle->put(key, value, trace).expect(RC::kOk);
+                if constexpr (kEnableHistory)
+                {
+                    ::hash::history.current().add(Record{
+                        .ma = kEvent,
+                        .ua = kCAS,
+                        .raddr = GlobalAddress{},
+                        .key = hkey,
+                    });
+                }
+                auto view = pcls.handle->prepare_kv(key.size(), value_size);
+                view.fill_key_value(key, value);
+
+                auto rc = pcls.handle->put();
+                if (avis_manager_ && avis_manager_->pool_nr() == 0)
+                {
+                    LOG(ERROR)
+                        << "Find anomalies: " << PRE(key) << ", " << PRE(value);
+                    enter_error(bls, token, key, hkey);
+                }
+                if (likely(rc == RC::kOk))
+                {
+                    kvs[key] = value;
+                }
+                else
+                {
+                    CHECK_EQ(rc, RC::kNoMem);
+                }
+            }
+            token->complete_task(1);
+        }
+    }
+
+    void enter_error(BLS &bls,
+                     ::bench::StopToken::pointer token,
+                     const std::string &key,
+                     HashKey hkey)
+    {
+        auto &pcls = bls.persistent_coroutine();
+        token->core().request_stop();
+        LOG(WARNING) << "on first known error " << PRE(table_);
+        LOG(WARNING) << "on first known error " << PRE(avis_manager_) << ", "
+                     << avis_manager_->pool_nr();
+
+        LOG(INFO) << "last RDMA ops: "
+                  << (rdma::history.current().history() |
+                      ranges::views::take(20));
+
+        // wait for everyone has finished
+        std::this_thread::sleep_for(100ms);
+
+        std::lock_guard<std::mutex> mu(lk_);
+        if (!err_)
+        {
+            // LOG(ERROR) << "expect " << PRE(RC::kOk) << ", got " << PRE(rc)
+            //            << ", expect " << PRE(kvs[key]) << ", got "
+            //            << PRE(get_v);
+            err_ = true;
+            err_key_ = key;
+            hkey_ = hkey;
+
+            auto last = ::hash::history.current().history() |
+                        ranges::views::filter(
+                            [this](const auto &r)
+                            { return r->key == hkey_ && r->ma == kQuery; }) |
+                        ranges::views::take(5);
+            CHECK(!last.empty()) << "** get no what we want";
+            raddr_ = last.front()->raddr;
+            LOG(ERROR) << PRE(raddr_);
+            pcls.handle->get_adaptor()->debug_explain_raddr(raddr_);
+        }
+    }
+
+    void on_end_bench(const ResultRecord &res,
+                      BLS &bls,
+                      const Config &conf) override
+    {
+        df_.reg_result(res, conf);
+        if (is_server())
+        {
+            LOG(INFO) << PRE(table_);
+            auto pools = avis_manager_->explain_allocatable_pools();
+            for (const auto &pool : pools)
+            {
+                LOG(INFO) << "pool utilization: " << pool.utilization();
+            }
+        }
+
+        if (is_client())
+        {
+            if (unlikely(err_))
+            {
+                LOG(INFO) << "Rollback and debugging";
+                LOG(INFO) << "Set up debug avis handle...";
+
+                const auto &policy = conf.get<avis::Policy>("avis_policy");
+                auto avis_handle = avis::AvisHandle::make_ptr(
+                    dsm_,
+                    avis_config_,
+                    std::vector<Provider>{avis_provider_},
+                    policy,
+                    nullptr /* ctx */);
+                avis_handle->update_metas();
+
+                using namespace ranges;
+
+                LOG(ERROR) << "trace back for " << PRE(hkey_);
+
+                auto all_related_his = ::hash::history.take(
+                    10,
+                    views::filter(
+                        [this](const auto &r)
+                        { return r->key == hkey_ || r->raddr == raddr_; }));
+
+                LOG(INFO) << PRE(all_related_his) << "$.";
+
+                auto last = all_related_his |
+                            views::filter([](const auto &r)
+                                          { return r->ma == kQuery; }) |
+                            views::take(1);
+
+                auto vec = last | to<std::vector>();
+
+                GlobalAddress kvblock_gaddr;
+                auto gaddr = raddr_;
+                kvblock_gaddr.nodeID = gaddr.nodeID;
+                {
+                    CHECK(!last.empty());
+                    auto data = last.front();
+                    LOG(INFO) << PRE(data);
+                    auto raddr = data->raddr;
+                    auto avis_addr = avis::AvisAddress::from_raddr(raddr);
+                    LOG(INFO) << PRE(raddr) << ", " << PRE(avis_addr);
+                    auto buffer = dsm_->get_rdma_buffer(64);
+                    memset(buffer.buffer, 0, 64);
+
+                    avis_handle->prepare_read(buffer.buffer, avis_addr, 8);
+                    avis_handle->commit();
+
+                    LOG(INFO) << std::endl << util::Hexdump(buffer.buffer, 64);
+                    uint64_t value = *(uint64_t *) buffer.buffer;
+                    util::TaggedPtrImpl<void> ptr(value);
+                    LOG(INFO) << PRE((void *) (uint64_t) ptr.u8_h()) << ", "
+                              << PRE((void *) (uint64_t) ptr.u8_l()) << ", "
+                              << PRE((void *) ptr.ptr());
+
+                    auto hash = hash_impl(err_key_.data(), err_key_.size());
+                    auto m = hash_m(hash);
+                    auto fp = hash_fp(hash);
+                    LOG(INFO) << PRE((void *) m) << ", " << PRE((void *) fp);
+                    CHECK_EQ(fp, ptr.u8_h()) << "** aha! fp mismatch";
+
+                    kvblock_gaddr.offset = (uint64_t) ptr.ptr();
+                }
+                {
+                    auto kvblock_buffer = dsm_->get_rdma_buffer(64);
+                    LOG(ERROR) << "Fetching buffer: " << PRE(kvblock_gaddr);
+                    dsm_->prepare_read(kvblock_buffer.buffer,
+                                       kvblock_gaddr,
+                                       64,
+                                       false,
+                                       nullptr);
+                    dsm_->commit(nullptr);
+                    KVBlock &block = *(KVBlock *) kvblock_buffer.buffer;
+                    LOG(INFO)
+                        << PRE(block.key_len) << ", " << PRE(block.value_len)
+                        << ", " << PRE((void *) block.hash);
+                    std::string got_key(block.key_len, ' ');
+                    std::string got_value(block.value_len, ' ');
+                    memcpy(got_key.data(), block.buf, block.key_len);
+                    memcpy(got_value.data(),
+                           block.buf + block.key_len,
+                           block.value_len);
+                    LOG(INFO) << PRE(got_key) << ", " << PRE(got_value);
+                    if (got_key == err_key_)
+                    {
+                        LOG(INFO) << "** match!!";
+                    }
+                    else
+                    {
+                        LOG(FATAL) << "** mismatch!!";
+                    }
+                }
+            }
+        }
+        Base::on_end_bench(res, bls, conf);
+    }
+
+private:
+    DSM::pointer dsm_;
+    size_t server_nid_;
+
+    Provider avis_provider_;
+    GlobalAddress race_meta_raddr_;
+
+    // avis
+    avis::Config avis_config_;
+
+    // server
+    RaceHashingConfig race_conf_;
+    typename RaceHashingT::pointer table_;  // for server
+    avis::AvisManager::Pointer avis_manager_;
+
+    std::mutex lk_;
+    Perthread<std::unordered_map<std::string, std::list<std::string>>> history_;
+    std::string err_key_;
+    HashKey hkey_;
+    GlobalAddress raddr_;
+    bool err_{false};
+
+    bench::ResultDataFrame df_;
+};
+
+int main(int argc, char *argv[])
+{
+    init_gflags(argc, argv);
+    avis::Config avis_config;
+    Experiment exp(avis_config);
+
+    bench::ConfigFactory f;
+    f.configure_thread_nr({16});
+    f.configure_coro_nr({3});
+
+    f.add_option<size_t>("kv_size", {4_KB});
+    f.add_option<size_t>("key_rng", {512});  // this is per client
+    f.add_option<size_t>("get_ratio", {80});
+    f.add_option<size_t>("delete_ratio", {0});
+    auto pf = avis::PolicyFactory{};
+    auto unsync_limit =
+        avis_config.huge_frame_size / avis_config.base_frame_size;
+    auto batch_policy = pf.batch_policy(unsync_limit);
+    f.add_option<avis::Policy>("avis_policy", {batch_policy});
+    auto configs = f.generate_configs();
+
+    exp.configure_monitor(1s, 5);
+    // exp.disable_monitor();
+    exp.launch_coroutines(configs);
+
+    LOG(INFO) << "PASS.";
+}

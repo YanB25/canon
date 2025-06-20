@@ -1,0 +1,1354 @@
+#pragma once
+#include <chrono>
+#include <ratio>
+
+#include "Metrics.h"
+#include "jemalloc_cpp/jemalloc_cpp.h"
+#include "util/Hexdump.hpp"
+#ifndef __DSM_H__
+#define __DSM_H__
+
+#include <fmt/core.h>
+#include <glog/logging.h>
+
+#include <atomic>
+#include <cstring>
+
+#include "ClockManager.h"
+#include "Connection.h"
+#include "CoroContext.h"
+#include "DSMCache.h"
+#include "DSMConfig.h"
+#include "DSMKeeper.h"
+#include "GlobalAddress.h"
+#include "GlobalAllocator.h"
+#include "LocalAllocator.h"
+#include "Pool.h"
+#include "RdmaBatch.h"
+#include "RdmaBuffer.h"
+#include "Worker.h"
+#include "memory/block_allocator.h"
+#include "memory/dsm_allocator.h"
+#include "memory/manual_poison.h"
+#include "memory/policy.h"
+#include "memory/refill_allocator.h"
+#include "memory/rolling_allocator.h"
+#include "memory/secondary_allocator.h"
+#include "rdmacpp/MR.h"
+#include "util/Metrics.h"
+#include "util/Numa.h"
+#include "util/Page.h"
+#include "util/Tracer.h"
+#include "util/concept.h"
+
+class DSMKeeper;
+class Directory;
+
+struct Identify
+{
+    int thread_id;
+    int node_id;
+};
+
+struct CoroAllocCtx
+{
+    char *buf;
+    size_t buf_size;
+    size_t cur_nid;
+};
+
+// what we get from a DSM::registerThread
+struct ThreadResourceDesc
+{
+    uint64_t thread_id{0};
+    uint64_t thread_name_id{0};
+    uint64_t thread_tag{0};
+    ThreadConnection *icon{nullptr};
+};
+
+inline std::ostream &operator<<(std::ostream &os,
+                                const ThreadResourceDesc &desc)
+{
+    os << "{ThreadResourceDesc tid: " << desc.thread_id
+       << ", tag: " << desc.thread_tag << ", icon: " << (void *) desc.icon
+       << "}";
+    return os;
+}
+
+namespace memory
+{
+class DSMAllocator;
+}
+
+class DSM
+{
+public:
+    constexpr static size_t V = ::config::verbose::kDSM;
+    constexpr static size_t SV = ::config::verbose::kSystem;
+    using pointer = std::shared_ptr<DSM>;
+    using WcErrHandler = WcErrHandler;
+
+    ThreadResourceDesc prepareThread();
+    ThreadResourceDesc getCurrentThreadDesc();
+    bool applyResource(const ThreadResourceDesc &, bool bind_core);
+    bool registerThread();
+    bool hasRegistered() const;
+
+    static std::shared_ptr<DSM> getInstance(const DSMConfig &conf);
+
+    const auto &remote_info()
+    {
+        return remoteInfo;
+    }
+
+    uint16_t getMyNodeID() const
+    {
+        return myNodeID;
+    }
+    uint16_t getMyThreadID() const
+    {
+        return thread_id_;
+    }
+    uint16_t getMyThreadNameID() const
+    {
+        return thread_name_id_;
+    }
+    uint16_t getClusterSize() const
+    {
+        return conf.machineNR;
+    }
+    uint64_t getThreadTag() const
+    {
+        return thread_tag_;
+    }
+
+    ibv_mr *create_umr(size_t dir_id, size_t klm_size);
+    void destroy_mr(ibv_mr *);
+
+    rdma::MemoryRegion create_secondary_mr(size_t size)
+    {
+        auto dir_id = 0;
+        auto &dir = dirCon[dir_id];
+        return dir->create_secondary_mr(size);
+    }
+    void free_secondary_mr(const rdma::MemoryRegion &mr)
+    {
+        auto dir_id = 0;
+        auto &dir = dirCon[dir_id];
+        dir->free_secondary_mr(mr);
+    }
+
+    mem::SecondaryAllocator::Pointer get_secondary_allocator();
+
+    void syncMetadataBootstrap(const ExchangeMeta &, size_t remoteID);
+
+    bool reconnectThreadToDir(size_t node_id, size_t dirID);
+
+    /**
+     * @brief Reinitialize the DirectoryConnection
+     *
+     * This function is helpful to dealloc the whole PD and re-init the Dir from
+     * the ground. After called, all the peers should be notified to call
+     * threadReconnectDir.
+     *
+     * @param dirID
+     * @return true
+     * @return false
+     */
+    bool reinitializeDir(size_t dirID);
+
+    void debug_show_exchanges()
+    {
+        for (size_t i = 0; i < getClusterSize(); ++i)
+        {
+            auto ex = getExchangeMetaBootstrap(i);
+            uint64_t digest = util::djb2_digest((char *) &ex, sizeof(ex));
+            LOG(INFO) << "[boot-meta] node: " << i
+                      << " digest: " << util::pre_hex(digest);
+        }
+    }
+
+    // RDMA operations
+    // buffer is registered memory
+    void read(char *buffer,
+              GlobalAddress gaddr,
+              size_t size,
+              bool signal = true,
+              CoroContext *ctx = nullptr);
+    void read_sync(char *buffer,
+                   GlobalAddress gaddr,
+                   size_t size,
+                   CoroContext *ctx = nullptr);
+    ibv_exp_send_wr *prepare_read(char *buffer,
+                                  GlobalAddress gaddr,
+                                  size_t size,
+                                  bool on_chip,
+                                  CoroContext *ctx = nullptr);
+    ibv_exp_send_wr *prepare_read(char *buffer,
+                                  uint32_t node_id,
+                                  uint32_t rkey,
+                                  uint64_t remote_addr,
+                                  size_t size,
+                                  CoroContext *ctx = nullptr);
+
+    void write(const char *buffer,
+               GlobalAddress gaddr,
+               size_t size,
+               bool signal = true,
+               CoroContext *ctx = nullptr);
+    ibv_exp_send_wr *prepare_write(char *buffer,
+                                   GlobalAddress gaddr,
+                                   size_t size,
+                                   bool on_chip,
+                                   CoroContext *ctx = nullptr);
+    ibv_exp_send_wr *prepare_write(char *buffer,
+                                   uint32_t node_id,
+                                   uint32_t rkey,
+                                   uint64_t remote_addr,
+                                   size_t size,
+                                   CoroContext *ctx = nullptr);
+    void prepare_reg_list_umr(ibv_mr *umr,
+                              size_t client_nid,
+                              size_t client_tid,
+                              size_t dir_id,
+                              ibv_exp_mem_region *mem_reg_list,
+                              size_t num_mrs,
+                              std::optional<uint64_t> base_addr,
+                              CoroContext *ctx = nullptr);
+    void prepare_reg_repeated_umr(ibv_mr *umr,
+                                  size_t client_nid,
+                                  size_t client_tid,
+                                  size_t dir_id,
+                                  ibv_mr **mrs,
+                                  size_t num_mrs,
+                                  std::optional<uint64_t> base_addr,
+                                  int rb_len,
+                                  int rb_stride,
+                                  int rb_count,
+                                  CoroContext *ctx = nullptr);
+    using ts_t = uint64_t;
+    // ts_t ordered_read_sync(char *buffer,
+    //                        GlobalAddress gaddr,
+    //                        size_t size,
+    //                        CoroContext *ctx = nullptr);
+    // ts_t ordered_write(const char *buffer,
+    //                    GlobalAddress gaddr,
+    //                    size_t size,
+    //                    size_t use_qp_nr,
+    //                    CoroContext *ctx);
+    ibv_exp_send_wr *prepare_cas(GlobalAddress gaddr,
+                                 size_t size,
+                                 uint64_t compare,
+                                 uint64_t compare_mask,
+                                 uint64_t swap,
+                                 uint64_t swap_mask,
+                                 void *rdma_buffer,
+                                 bool on_chip,
+                                 CoroContext *ctx = nullptr);
+    ibv_exp_send_wr *prepare_cas(uint32_t node_id,
+                                 uint32_t rkey,
+                                 uint64_t remote_addr,
+                                 size_t size,
+                                 uint64_t compare,
+                                 uint64_t compare_mask,
+                                 uint64_t swap,
+                                 uint64_t swap_mask,
+                                 void *rdma_buffer,
+                                 CoroContext *ctx = nullptr);
+    ibv_exp_send_wr *prepare_faa(GlobalAddress gaddr,
+                                 size_t size,
+                                 uint64_t add_val,
+                                 uint64_t field_boundrary,
+                                 void *rdma_buffer,
+                                 bool on_chip,
+                                 CoroContext *ctx = nullptr);
+    ibv_exp_send_wr *prepare_faa(uint32_t node_id,
+                                 uint32_t rkey,
+                                 uint64_t remote_addr,
+                                 size_t size,
+                                 uint64_t add_val,
+                                 uint64_t field_boundrary,
+                                 void *rdma_buffer,
+                                 CoroContext *ctx = nullptr);
+    void debug()
+    {
+    }
+
+    void commit(CoroContext *ctx = nullptr,
+                util::TraceView trace = util::nulltrace);
+    void commit_no_wait(CoroContext *ctx);
+
+    int try_master_coro_poll(CoroContext *ctx, size_t limit = 16);
+
+    void write_sync(const char *buffer,
+                    GlobalAddress gaddr,
+                    size_t size,
+                    CoroContext *ctx = nullptr);
+
+    void write_batch(RdmaOpRegion *rs,
+                     int k,
+                     bool signal = true,
+                     CoroContext *ctx = nullptr);
+    void write_batch_sync(RdmaOpRegion *rs, int k, CoroContext *ctx = nullptr);
+
+    void write_faa(RdmaOpRegion &write_ror,
+                   RdmaOpRegion &faa_ror,
+                   uint64_t add_val,
+                   bool signal = true,
+                   CoroContext *ctx = nullptr);
+    void write_faa_sync(RdmaOpRegion &write_ror,
+                        RdmaOpRegion &faa_ror,
+                        uint64_t add_val,
+                        CoroContext *ctx = nullptr);
+
+    void write_cas(RdmaOpRegion &write_ror,
+                   RdmaOpRegion &cas_ror,
+                   uint64_t equal,
+                   uint64_t val,
+                   bool signal = true,
+                   CoroContext *ctx = nullptr);
+    void write_cas_sync(RdmaOpRegion &write_ror,
+                        RdmaOpRegion &cas_ror,
+                        uint64_t equal,
+                        uint64_t val,
+                        CoroContext *ctx = nullptr);
+    inline ibv_qp *get_dir_qp(int node_id, int thread_id, size_t dirID);
+    inline ibv_cq *get_dir_cq(size_t dirID);
+    inline ibv_qp *get_th_qp(int node_id, size_t dirID);
+    rdma::QP &get_th_cqp(int node_id, size_t dir_id)
+    {
+        return iCon_->QPs[dir_id][node_id];
+    }
+    rdma::QP &get_dir_cqp(int node_id, int thread_id, size_t dir_id)
+    {
+        return dirCon[dir_id]->QPs[thread_id][node_id];
+    }
+    ibv_exp_dm *get_dir_dm()
+    {
+        auto dir_id = 0;
+        return dirCon[dir_id]->ctx.dm;
+    }
+    inline mlx5::IQP &get_th_iqp(int node_id, size_t dirID);
+    inline ibv_pd *get_th_pd();
+    inline ibv_mr *get_dir_mr(size_t dirID);
+    ibv_mr *get_dir_dm_mr()
+    {
+        auto dir_id = 0;
+        return dirCon[dir_id]->lockMR;
+    }
+    inline ibv_mr *get_dm_mr()
+    {
+        return dirCon.front()->lockMR;
+    }
+    Buffer get_dm()
+    {
+        char *dm_addr = (char *) dirCon.front()->dmPool;
+        size_t dm_size = dirCon.front()->lockSize;
+        return {dm_addr, dm_size};
+    }
+    inline RdmaContext *get_dir_rdma_context(size_t dirID);
+    inline RdmaContext *get_th_rdma_context(size_t dirID);
+    inline uint32_t get_rkey(size_t node_id, size_t dir_id);
+
+    /**
+     * get_dsm_allocator() returns a practically best allocator for allocating
+     * DSM memory.
+     * It is per-thread.
+     */
+    auto get_dsm_allocator()
+    {
+        return dsm_local_allocator_;
+    }
+
+    void cas(GlobalAddress gaddr,
+             uint64_t equal,
+             uint64_t val,
+             uint64_t *rdma_buffer,
+             bool signal = true,
+             CoroContext *ctx = nullptr);
+    bool cas_sync(GlobalAddress gaddr,
+                  uint64_t equal,
+                  uint64_t val,
+                  uint64_t *rdma_buffer,
+                  CoroContext *ctx = nullptr);
+
+    void cas_read(RdmaOpRegion &cas_ror,
+                  RdmaOpRegion &read_ror,
+                  uint64_t equal,
+                  uint64_t val,
+                  bool signal = true,
+                  CoroContext *ctx = nullptr);
+    bool cas_read_sync(RdmaOpRegion &cas_ror,
+                       RdmaOpRegion &read_ror,
+                       uint64_t equal,
+                       uint64_t val,
+                       CoroContext *ctx = nullptr);
+
+    void cas_mask(GlobalAddress gaddr,
+                  uint64_t equal,
+                  uint64_t val,
+                  uint64_t *rdma_buffer,
+                  uint64_t mask = ~(0ull),
+                  bool signal = true);
+    bool cas_mask_sync(GlobalAddress gaddr,
+                       uint64_t equal,
+                       uint64_t val,
+                       uint64_t *rdma_buffer,
+                       uint64_t mask = ~(0ull));
+
+    void faa_boundary(GlobalAddress gaddr,
+                      uint64_t add_val,
+                      uint64_t *rdma_buffer,
+                      uint64_t mask = 63,
+                      bool signal = true,
+                      CoroContext *ctx = nullptr);
+    void faa_boundary_sync(GlobalAddress gaddr,
+                           uint64_t add_val,
+                           uint64_t *rdma_buffer,
+                           uint64_t mask = 63,
+                           CoroContext *ctx = nullptr);
+
+    // for on-chip device memory
+    void read_dm(char *buffer,
+                 GlobalAddress gaddr,
+                 size_t size,
+                 bool signal = true,
+                 CoroContext *ctx = nullptr);
+    void read_dm_sync(char *buffer,
+                      GlobalAddress gaddr,
+                      size_t size,
+                      CoroContext *ctx = nullptr);
+
+    void write_dm(const char *buffer,
+                  GlobalAddress gaddr,
+                  size_t size,
+                  bool signal = true,
+                  CoroContext *ctx = nullptr);
+    void write_dm_sync(const char *buffer,
+                       GlobalAddress gaddr,
+                       size_t size,
+                       CoroContext *ctx = nullptr);
+
+    void cas_dm(GlobalAddress gaddr,
+                uint64_t equal,
+                uint64_t val,
+                uint64_t *rdma_buffer,
+                bool signal = true,
+                CoroContext *ctx = nullptr);
+    bool cas_dm_sync(GlobalAddress gaddr,
+                     uint64_t equal,
+                     uint64_t val,
+                     uint64_t *rdma_buffer,
+                     CoroContext *ctx = nullptr);
+
+    void cas_dm_mask(GlobalAddress gaddr,
+                     uint64_t equal,
+                     uint64_t val,
+                     uint64_t *rdma_buffer,
+                     uint64_t mask = ~(0ull),
+                     bool signal = true);
+    bool cas_dm_mask_sync(GlobalAddress gaddr,
+                          uint64_t equal,
+                          uint64_t val,
+                          uint64_t *rdma_buffer,
+                          uint64_t mask = ~(0ull));
+
+    void faa_dm_boundary(GlobalAddress gaddr,
+                         uint64_t add_val,
+                         uint64_t *rdma_buffer,
+                         uint64_t mask = 63,
+                         bool signal = true,
+                         CoroContext *ctx = nullptr);
+    void faa_dm_boundary_sync(GlobalAddress gaddr,
+                              uint64_t add_val,
+                              uint64_t *rdma_buffer,
+                              uint64_t mask = 63,
+                              CoroContext *ctx = nullptr);
+    ibv_mw *alloc_mw(size_t dirID);
+    void free_mw(struct ibv_mw *mw);
+    bool bind_memory_region(struct ibv_mw *mw,
+                            size_t target_node_id,
+                            size_t target_thread_id,
+                            const char *buffer,
+                            size_t size,
+                            size_t dirID,
+                            size_t wr_id,
+                            bool signal);
+    bool bind_memory_region_sync(struct ibv_mw *mw,
+                                 size_t target_node_id,
+                                 size_t target_thread_id,
+                                 const char *buffer,
+                                 size_t size,
+                                 size_t dirID,
+                                 uint64_t wr_id,
+                                 CoroContext *ctx = nullptr);
+
+    /**
+     * @brief poll rdma cq
+     *
+     * @param buf buffer of at least sizeof(ibv_wc) * @limit length
+     * @param limit
+     * @return size_t the number of wc actually polled
+     */
+    inline int try_poll_rdma_cq(size_t count, ibv_wc *wc);
+    inline uint64_t poll_rdma_cq(int count = 1);
+    inline bool poll_rdma_cq_once(uint64_t &wr_id);
+    inline int poll_dir_cq(size_t dirID, size_t count);
+    inline size_t try_poll_dir_cq(ibv_wc *buf, size_t dirID, size_t limit);
+
+    std::optional<uint64_t> sum(uint64_t value,
+                                std::chrono::nanoseconds timeout)
+    {
+        static uint64_t count = 0;
+        return keeper->try_sum(
+            std::string("sum-") + std::to_string(count++), value, timeout);
+    }
+    // clang-format off
+    /**
+     * The layout of buffer:
+     * [dsm_reserve_size()] [user_reserve_size()] [buffer_size()]
+     * ^-- dsm_base()                             ^-- get_server_buffer();
+     *                      ^-- get_server_reserved_buffer()
+     * ^-- get_server_internal_dsm_buffer()
+     * 
+     * DSM offset:
+     *                      |<---------------------------->|
+     * call dsm_offset_to_addr(dsm_offset) / addr_to_dsm_offset(addr)
+     * 
+     * Buffer offset:
+     *                                             |<----->|
+     * call buffer_offset_to_addr(buf_offset) / addr_to_buffer_offset(addr)
+     * 
+     * The DSM reserved region:
+     * |<---------------->|
+     * It is reserved by DSM. Will never expose to the outer world
+     * 
+     */
+    // clang-format on
+    size_t dsm_reserve_size() const
+    {
+        // an area for ExchangeMeta data
+        return 0;
+    }
+
+    size_t user_reserve_size() const
+    {
+        return 0;
+    }
+    size_t total_reserve_size() const
+    {
+        auto dsm_reserve = dsm_reserve_size();
+        auto user_reserve = user_reserve_size();
+        auto reserve = dsm_reserve + user_reserve;
+
+        DCHECK_LT(reserve, total_dsm_buffer_size());
+        return reserve;
+    }
+    size_t buffer_size() const
+    {
+        return conf.dsmSize;
+    }
+    size_t total_dsm_buffer_size() const
+    {
+        DCHECK_EQ(baseAddrSize,
+                  dsm_reserve_size() + user_reserve_size() + buffer_size());
+        return baseAddrSize;
+    }
+
+    uint64_t gaddr_to_addr(const GlobalAddress &gaddr)
+    {
+        auto base =
+            (uint64_t) remoteInfo[gaddr.nodeID].dsmBase + dsm_reserve_size();
+        return base + gaddr.offset;
+    }
+    void *dsm_offset_to_addr(uint64_t offset)
+    {
+        return (char *) dsm_base() + dsm_reserve_size() + offset;
+    }
+    uint64_t addr_to_dsm_offset(void *addr) const
+    {
+        auto exposed_base = baseAddr + dsm_reserve_size();
+        CHECK_GE((void *) addr, (void *) exposed_base) << "** addr underflow";
+        return (uint64_t) addr - exposed_base;
+    }
+    void *buffer_offset_to_addr(uint64_t offset) const
+    {
+        return (char *) dsm_base() + offset + total_reserve_size();
+    }
+    uint64_t addr_to_buffer_offset(void *addr) const
+    {
+        void *base = (char *) dsm_base() + total_reserve_size();
+        CHECK_GE(addr, base);
+        return (char *) addr - (char *) base;
+    }
+    uint64_t buffer_offset_to_dsm_offset(uint64_t buf_offset) const
+    {
+        return buf_offset + user_reserve_size();
+    }
+    uint64_t dsm_offset_to_buffer_offset(uint64_t dsm_offset) const
+    {
+        CHECK_GE(dsm_offset, user_reserve_size());
+        return dsm_offset - user_reserve_size();
+    }
+
+    bool valid_buffer_offset(uint64_t buffer_offset) const
+    {
+        return buffer_offset < buffer_size();
+    }
+    bool valid_buffer_addr(void *addr) const
+    {
+        return valid_buffer_offset(addr_to_buffer_offset(addr));
+    }
+    bool valid_dsm_offset(uint64_t dsm_offset) const
+    {
+        return dsm_offset < user_reserve_size() + buffer_size();
+    }
+    bool valid_dsm_addr(void *addr) const
+    {
+        return valid_dsm_offset(addr_to_dsm_offset(addr));
+    }
+
+    ExchangeMeta &getExchangeMetaBootstrap(size_t node_id) const;
+
+    // Memcached operations for sync
+    template <typename T, Memcpyable V>
+    void put(const std::string &key, const V &v, const T &sleep_time)
+    {
+        auto actual_key = "__DSM:" + key;
+        auto value = std::string((const char *) &v, sizeof(V));
+        keeper->memSet(actual_key.c_str(),
+                       actual_key.size(),
+                       value.c_str(),
+                       value.size(),
+                       sleep_time);
+    }
+    template <typename T>
+    void put(const std::string &key,
+             const void *buf,
+             size_t size,
+             const T &sleep_time)
+    {
+        auto actual_key = "__DSM:" + key;
+        keeper->memSet(actual_key.c_str(),
+                       actual_key.size(),
+                       (char *) buf,
+                       size,
+                       sleep_time);
+    }
+
+    void put(const std::string &key,
+             const void *val_buf,
+             size_t val_len,
+             std::chrono::nanoseconds ns)
+    {
+        auto actual_key = "__DSM:" + key;
+        keeper->memSet(actual_key.c_str(),
+                       actual_key.size(),
+                       (char *) val_buf,
+                       val_len,
+                       ns);
+    }
+
+    template <typename T>
+    std::string try_get(const std::string &key, const T &sleep_time)
+    {
+        auto actual_key = "__DSM:" + key;
+        size_t size = 0;
+        auto *ret = keeper->memTryGet(
+            actual_key.c_str(), actual_key.size(), &size, sleep_time);
+        std::string value;
+        value.resize(size);
+        memcpy(value.data(), ret, size);
+        ::free(ret);
+        return value;
+    }
+    template <typename V, typename T>
+    V get(const std::string &key, const T &sleep_time)
+    {
+        auto actual_key = "__DSM:" + key;
+        size_t size = 0;
+        auto *ret = keeper->memGet(
+            actual_key.c_str(), actual_key.size(), &size, sleep_time);
+        V value;
+        memcpy(&value, ret, size);
+        ::free(ret);
+        return value;
+    }
+    template <typename T>
+    void *get_raw(const std::string &key, const T &sleep_time)
+    {
+        auto actual_key = "__DSM:" + key;
+        size_t size = 0;
+        auto *ret = keeper->memGet(
+            actual_key.c_str(), actual_key.size(), &size, sleep_time);
+        return ret;
+    }
+    template <typename Duration>
+    void keeper_barrier(const std::string &key, Duration sleep_time)
+    {
+        VLOG(SV) << "[DSM] Entering Barrier " << key;
+        // LOG(INFO) << "[DSM] Entering Barrier " << key;
+        keeper->barrier(key, sleep_time);
+        // LOG(INFO) << "[DSM] Leaving Barrier " << key;
+        VLOG(SV) << "[DSM] Leaving Barrier " << key;
+    }
+    template <typename Duration>
+    void keeper_partial_barrier(const std::string &key,
+                                size_t expect_nr,
+                                bool is_master,
+                                Duration sleep_time)
+    {
+        VLOG(SV) << "[DSM] Entering Barrier " << key << " (expect " << expect_nr
+                 << ", is_master: " << is_master << ")";
+        keeper->partial_barrier(key, expect_nr, is_master, sleep_time);
+        VLOG(SV) << "[DSM] Leaving Barrier " << key << " (expect " << expect_nr
+                 << ", is_master: " << is_master << ")";
+    }
+
+    RdmaOperationBatch &get_batch(CoroContext *ctx)
+    {
+        if (ctx)
+        {
+            return rdma_op_batch_[ctx->coro_id()];
+        }
+        return rdma_op_batch_[0];
+    }
+    /**
+     * explain_gaddr return the node_id and *addressable* local pointer of gaddr
+     */
+    std::pair<uint16_t, void *> explain_gaddr(GlobalAddress gaddr)
+    {
+        auto node_id = gaddr.nodeID;
+        auto offset = gaddr.offset;
+        return {node_id, (void *) (remoteInfo[node_id].dsmBase + offset)};
+    }
+    GlobalAddress to_exposed_gaddr(void *addr)
+    {
+        void *base = (void *) get_base_addr();
+        DCHECK_GE((uint64_t) addr, (uint64_t) base);
+        auto offset = (char *) addr - (char *) base;
+        GlobalAddress ret;
+        ret.nodeID = get_node_id();
+        ret.offset = offset;
+        return ret;
+    }
+
+    DSM(const DSMConfig &conf);
+    virtual ~DSM();
+
+    size_t get_node_id() const
+    {
+        return keeper->getMyNodeID();
+    }
+    size_t get_numa_id() const
+    {
+        auto &numa_ctl = util::NUMACtl::tl_ins();
+        return numa_ctl.get_numa_affinity();
+    }
+    int get_thread_id() const
+    {
+        DCHECK_EQ(thread_id_, util::get_thread_id());
+        return thread_id_;
+    }
+    size_t get_cpu_id() const
+    {
+        auto &numa_ctl = util::NUMACtl::tl_ins();
+        return numa_ctl.get_cpu_affinity();
+    }
+    int get_thread_name_id() const
+    {
+        return thread_name_id_;
+    }
+    size_t hardware_concurrency() const
+    {
+        auto &numa_ctl = util::NUMACtl::tl_ins();
+        return numa_ctl.cpu_nr();
+    }
+    Identify get_identify() const
+    {
+        Identify id;
+        id.node_id = get_node_id();
+        id.thread_id = get_thread_id();
+        return id;
+    }
+    bool recoverDirQP(int node_id, int thread_id, size_t dirID);
+    bool recoverThreadQP(int node_id,
+                         size_t dirID,
+                         util::TraceView v = util::nulltrace);
+
+    void roll_dir()
+    {
+        cur_dir_ = (cur_dir_ + 1) % NR_DIRECTORY;
+    }
+    /**
+     * @brief only call this if you know what you are doing.
+     *
+     * @param dir
+     */
+    void force_set_dir(size_t dir)
+    {
+        CHECK_LT(dir, dirCon.size());
+        cur_dir_ = dir;
+    }
+    bool unreliable_prepare_send(const char *buf,
+                                 size_t size,
+                                 uint16_t node_id,
+                                 size_t dir_id)
+    {
+        DCHECK(false) << "Empirically: batching does not make performance "
+                         "better. Please do not use me.";
+        return umsg_->prepare_send(get_thread_id(), buf, size, node_id, dir_id);
+    }
+    void unreliable_commit_send()
+    {
+        return umsg_->commit_send(get_thread_id());
+    }
+
+    void unreliable_send(const char *buf,
+                         size_t size,
+                         uint16_t node_id,
+                         size_t dir_id)
+    {
+        return umsg_->send(get_thread_id(), buf, size, node_id, dir_id);
+    }
+    size_t unreliable_try_recv(char *ibuf, size_t limit = 1)
+    {
+        return umsg_->try_recv(get_thread_id(), ibuf, limit);
+    }
+    using msg_desc_t = UnreliableConnection<kCorePerNuma>::msg_desc_t;
+    size_t unreliable_try_recv_no_cpy(msg_desc_t *msg_descs, size_t limit = 1)
+    {
+        return umsg_->try_recv_no_cpy(get_thread_id(), msg_descs, limit);
+    }
+    size_t unreliable_try_recv_no_cpy_from(size_t from_ep,
+                                           msg_desc_t *msg_descs,
+                                           size_t limit = 1)
+    {
+        return umsg_->try_recv_no_cpy(from_ep, msg_descs, limit);
+    }
+    void return_buf_no_cpy(msg_desc_t *msg_descs, size_t size)
+    {
+        return umsg_->return_buf_no_cpy(get_thread_id(), msg_descs, size);
+    }
+    void return_buf_no_cpy_from(size_t ep_id,
+                                msg_desc_t *msg_descs,
+                                size_t size)
+    {
+        return umsg_->return_buf_no_cpy(ep_id, msg_descs, size);
+    }
+    void unreliable_recv(char *ibuf, size_t limit = 1)
+    {
+        return umsg_->recv(get_thread_id(), ibuf, limit);
+    }
+    void unreliable_recv_from(size_t ep_id, char *ibuf, size_t limit = 1)
+    {
+        return umsg_->recv(ep_id, ibuf, limit);
+    }
+    inline uint32_t get_icon_lkey();
+    inline ibv_cq *get_icon_ibcq()
+    {
+        return iCon_->ibcq();
+    }
+    inline rdma::CQ *get_icon_cq()
+    {
+        return iCon_->cq();
+    }
+    auto &get_icon()
+    {
+        return iCon_;
+    }
+    inline uint32_t get_dir_lkey(size_t dir_id)
+    {
+        return dirCon[dir_id]->dsmLKey;
+    }
+
+    inline bool modify_th_qp_access_flag(int node_id,
+                                         size_t dir_id,
+                                         uint64_t flags);
+    inline bool modify_dir_qp_access_flag(size_t node_id,
+                                          size_t thread_id,
+                                          size_t dir_id,
+                                          uint64_t flags);
+    util::MetricCollector &metrics()
+    {
+        return c_;
+    }
+    const util::MetricCollector &metrics() const
+    {
+        return c_;
+    }
+
+private:
+    inline bool modify_qp_access_flag(ibv_qp *, uint64_t flags);
+
+    inline void *dsm_base() const
+    {
+        DCHECK_EQ(baseAddr, remoteInfo[get_node_id()].dsmBase);
+        return (void *) baseAddr;
+    }
+    void initRDMAConnection();
+    void initExchangeMetadataBootstrap();
+    void fill_keys_dest(RdmaOpRegion &ror,
+                        GlobalAddress addr,
+                        bool is_chip,
+                        size_t dirID = 0);
+
+    size_t get_cur_dir() const
+    {
+        return cur_dir_;
+    }
+
+    DSMConfig conf;
+    DSMCache cache;
+
+    constexpr static size_t kRdmaBufBlockSize = 2_MB;
+    mem::RollingAllocator::pointer g_rdma_buf_allocator_;
+    std::shared_ptr<mem::BaseAllocator> g_dsm_allocator_;
+    // Allocating *local* DSM memory while concurrent (remote, from-client)
+    // allocations occur
+    static thread_local mem::LazySlabAllocator::pointer dsm_local_allocator_;
+
+    // thread_id_ is high coupled to the resources, i.e, QPs
+    static thread_local int thread_id_;
+    // thread name id is the id used for debugging. The unique identify of the
+    // thread.
+    static thread_local int thread_name_id_;
+    static thread_local ThreadConnection *iCon_;
+    // Allocating remote-side DSM memory with local caching enabled
+    Perthread<std::shared_ptr<::memory::DSMAllocator>> dsm_allocator_;
+    static thread_local RdmaBuffer rbuf_[define::kMaxCoroNr];
+    static thread_local uint64_t thread_tag_;
+    static thread_local util::MetricCollector c_;
+    static thread_local Jemalloc::JemallocAllocator<
+        Jemalloc::Tag::RDMA_Buf>::pointer rdma_buf_allocator_;
+
+    uint64_t baseAddr;
+    uint64_t baseAddrSize;
+    uint32_t myNodeID;
+
+    static thread_local std::vector<RdmaOperationBatch> rdma_op_batch_;
+
+    std::vector<RemoteConnection> remoteInfo;
+    std::vector<std::unique_ptr<ThreadConnection>> thCon;
+    std::vector<std::unique_ptr<DirectoryConnection>> dirCon;
+    std::unique_ptr<DSMKeeper> keeper;
+
+    // if NR_DIRECTORY is not 1, there is multiple dir to use.
+    // this val chooses the current in-use dir.
+    std::atomic<size_t> cur_dir_{0};
+
+    // ClockManager clock_manager_;
+    std::unique_ptr<UnreliableConnection<kCorePerNuma>> umsg_;
+
+    std::vector<std::shared_ptr<Directory>> dir_agent_;
+    std::vector<std::unique_ptr<Worker>> workers_;
+
+    Perthread<AllocMetrics> dsm_usage_;
+
+    static thread_local std::vector<CoroAllocCtx> coro_alloc_ctx_;
+
+public:
+    AllocMetrics dsm_usage() const
+    {
+        return dsm_usage_.sum();
+    }
+    AllocMetrics dsm_self_usage() const
+    {
+        return dsm_usage_.current();
+    }
+    void reset_dsm_usage()
+    {
+        for (auto &u : dsm_usage_)
+        {
+            u.get().reset();
+        }
+    }
+
+    uint64_t get_base_addr() const
+    {
+        return baseAddr;
+    }
+    uint64_t get_base_size() const
+    {
+        return baseAddrSize;
+    }
+    uint32_t get_base_rkey(size_t dir_id) const
+    {
+        return dirCon[dir_id]->dsmMR->rkey;
+    }
+    bool is_register()
+    {
+        return thread_id_ != -1;
+    }
+    const auto &get_cache() const
+    {
+        return cache;
+    }
+
+    /**
+     * get_rdma_buffer(size): allocate a piece of RDMA buffer for the clients
+     *
+     * The management of RDMA buffer follows the rules:
+     * - During the ctor of DSM: uses {cache.data, cache.size}
+     * - After the ctor of DSM: {cache.data, cache.size} gived to
+     * g_rdma_buf_allocator_. USE g_rdma_buf_allocator_ instead.
+     * - After any worker threads registered: USE DSM::get_rdma_buffer(size)
+     *
+     * - DSM manages the buffers globally through g_rdma_buf_allocator_
+     */
+    Buffer get_rdma_buffer(size_t size)
+    {
+        DCHECK(hasRegistered());
+        char *buf = do_rdma_buf_allocate(size);
+        if (likely(buf != nullptr))
+        {
+            // void *debug = CHECK_NOTNULL(::malloc(size));
+            // return {buf, size, debug};
+            return {buf, size};
+        }
+        else
+        {
+            LOG(FATAL) << "** possibly run out of buffer: "
+                       << rdma_buf_allocator_->usage();
+            return {nullptr, 0};
+            // return {nullptr, 0, nullptr};
+        }
+    }
+    void put_rdma_buffer(Buffer &&buf)
+    {
+        do_rdma_buf_deallocate(buf.buffer, buf.size);
+        // ::free(buf.debug_leak_);
+    }
+    char *do_rdma_buf_allocate(size_t size)
+    {
+        DCHECK(hasRegistered());
+        auto alignment = 8;
+        char *ret = (char *) rdma_buf_allocator_->alloc(size, alignment);
+        DCHECK_EQ((uint64_t) ret % alignment, 0);
+        return ret;
+    }
+    void do_rdma_buf_deallocate(void *buf, size_t size)
+    {
+        DCHECK(hasRegistered());
+        rdma_buf_allocator_->free(buf, size);
+    }
+    auto get_rdma_buffer_allocator()
+    {
+        return rdma_buf_allocator_;
+    }
+    inline Buffer get_server_internal_dsm_buffer();
+    inline Buffer get_server_reserved_buffer();
+    inline Buffer get_server_buffer();
+    RdmaBuffer &get_rbuf(coro_t coro_id)
+    {
+        DCHECK_LT(coro_id, define::kMaxCoroNr)
+            << "coro_id should be < define::kMaxCoroNr";
+        return rbuf_[coro_id];
+    }
+
+    GlobalAddress alloc(size_t size, size_t alignment = 8);
+    GlobalAddress alloc_from(size_t size, size_t node_id, size_t alignment = 8);
+    GlobalAddress alloc2(size_t size,
+                         CoroContext *ctx,
+                         const mem::Policy &p = mem::default_policy);
+    GlobalAddress rpc_alloc(size_t size,
+                            CoroContext *ctx,
+                            const mem::Policy &p = mem::default_policy);
+    GlobalAddress rpc_alloc_from(size_t size, size_t node_id, CoroContext *ctx);
+    void free(GlobalAddress addr, size_t size);
+
+    void debug_allocator()
+    {
+        static std::mutex mu_;
+        std::lock_guard<std::mutex> lk_(mu_);
+
+        size_t idx = 0;
+        for (auto &alloc : dsm_allocator_)
+        {
+            if (alloc.get() != nullptr)
+            {
+                LOG(INFO) << "Idx " << idx << " "
+                          << PRE(*dsm_allocator_.current());
+            }
+            idx++;
+        }
+    }
+
+    /**
+     * get_rdma_page(size): similar to get_rdma_buffer
+     * The main difference is the return type, i.e., Page,
+     * which is more flexible then Buffer.
+     * A page is allowed to be non-DMA-able
+     * (although this function always returns a DMA-able one),
+     * while Buffer must be DMA-able.
+     *
+     * The other difference is that: no need to call put_rdma_page,
+     * because a page's dctor reclaims automatically.
+     */
+    util::Page get_rdma_page(size_t size)
+    {
+        DCHECK(hasRegistered());
+        return util::Page(this, size);
+    }
+
+    size_t get_icon_nr() const
+    {
+        return thCon.size();
+    }
+
+    void rpc_call_dir(const RawMessage &m,
+                      uint16_t node_id,
+                      uint16_t dir_id = 0)
+    {
+        auto buffer = (RawMessage *) iCon_->message->getSendPool();
+
+        memcpy(buffer, &m, sizeof(RawMessage));
+        buffer->node_id = myNodeID;
+        buffer->app_id = thread_id_;
+
+        iCon_->sendMessage2Dir(buffer, node_id, dir_id);
+    }
+    char *try_recv()
+    {
+        // size_t cur_dir = get_cur_dir();
+        size_t cur_dir = 0;
+        struct ibv_wc wc;
+        ibv_cq *cq = dirCon[cur_dir]->rpc_cq;
+        int ret = ibv_poll_cq(cq, 1, &wc);
+        if (ret < 0)
+        {
+            LOG(ERROR) << "failed to poll cq. cq: " << cq << ". ret: " << ret;
+            return nullptr;
+        }
+        if (ret == 1)
+        {
+            CHECK(wc.status == IBV_WC_SUCCESS);
+            CHECK(wc.opcode == IBV_WC_RECV);
+            auto *m = (RawMessage *) dirCon[cur_dir]->message->getMessage();
+            return m->inlined_buffer;
+        }
+        return nullptr;
+    }
+    char *recv()
+    {
+        // size_t cur_dir = get_cur_dir();
+        // dwarn("TODO: now always use the first as message dir.");
+        size_t cur_dir = 0;
+
+        struct ibv_wc wc;
+        pollWithCQ(dirCon[cur_dir]->rpc_cq, 1, &wc);
+        switch (int(wc.opcode))
+        {
+        case IBV_WC_RECV:
+        {
+            auto *m = (RawMessage *) dirCon[cur_dir]->message->getMessage();
+            return m->inlined_buffer;
+        }
+        default:
+        {
+            assert(false);
+        }
+        }
+        return nullptr;
+    }
+
+    RawMessage *rpc_wait()
+    {
+        ibv_wc wc;
+
+        pollWithCQ(iCon_->rpc_cq, 1, &wc);
+        return (RawMessage *) iCon_->message->getMessage();
+    }
+
+    void explain()
+    {
+        // auto dsm_buffer = get_server_internal_dsm_buffer();
+        // auto resv_buffer = get_server_reserved_buffer();
+        // auto int_buffer = get_server_buffer();
+        // LOG(INFO) << "[DSM] node_id: " << get_node_id()
+        //           << ", dsm_internal_base: " << (void *) baseAddr
+        //           << ", dsm_internal_len: " << baseAddrSize
+        //           << ", dsm reserved buffer: " << dsm_buffer
+        //           << ", user reserved buffer: " << resv_buffer
+        //           << ", DSM buffer: " << int_buffer;
+        // CHECK_GE((uint64_t) dsm_buffer.buffer, baseAddr);
+        // CHECK_GE(resv_buffer.buffer, dsm_buffer.buffer);
+        // CHECK_GE(int_buffer.buffer, resv_buffer.buffer);
+        // CHECK_EQ(int_buffer.buffer - resv_buffer.buffer, resv_buffer.size);
+        // CHECK_EQ(resv_buffer.buffer - dsm_buffer.buffer, dsm_buffer.size);
+        // CHECK_EQ(resv_buffer.size + int_buffer.size + dsm_buffer.size,
+        //          baseAddrSize);
+        // LOG(INFO) << "[DSM] node_id: " << get_node_id() << ", DSM: [" <<
+        // (void*) baseAddr << ", " << (uint64_t)baseAddr +
+        LOG(INFO) << fmt::format(
+            "[DSM] node_id: {}, DSM: [{:#x}, {:#x}), size: {}, rkey[0]: {}, "
+            "cache: [{:#x}, "
+            "{:#x}), "
+            "size: {}",
+            get_node_id(),
+            baseAddr,
+            baseAddr + baseAddrSize,
+            baseAddrSize,
+            get_base_rkey(0),
+            cache.data,
+            cache.data + cache.size,
+            cache.size);
+    }
+};
+
+ibv_qp *DSM::get_dir_qp(int node_id, int thread_id, size_t dirID)
+{
+    DCHECK_LT(dirID, dirCon.size());
+    return dirCon[dirID]->QPs[thread_id][node_id].ibqp();
+}
+ibv_cq *DSM::get_dir_cq(size_t dirID)
+{
+    DCHECK_LT(dirID, dirCon.size());
+    return dirCon[dirID]->ibcq();
+}
+ibv_qp *DSM::get_th_qp(int node_id, size_t dirID)
+{
+    DCHECK_LT(dirID, iCon_->QPs.size());
+    return iCon_->QPs[dirID][node_id].ibqp();
+}
+mlx5::IQP &DSM::get_th_iqp(int node_id, size_t dirID)
+{
+    DCHECK_LT(dirID, iCon_->QPs.size());
+    return iCon_->iQPs[dirID][node_id];
+}
+ibv_pd *DSM::get_th_pd()
+{
+    return iCon_->pd();
+}
+uint32_t DSM::get_rkey(size_t node_id, size_t dir_id)
+{
+    return remoteInfo[node_id].dsmRKey[dir_id];
+}
+ibv_mr *DSM::get_dir_mr(size_t dirID)
+{
+    DCHECK_LT(dirID, dirCon.size());
+    return dirCon[dirID]->dsmMR;
+}
+RdmaContext *DSM::get_dir_rdma_context(size_t dirID)
+{
+    DCHECK_LT(dirID, dirCon.size());
+    return &dirCon[dirID]->ctx;
+}
+RdmaContext *DSM::get_th_rdma_context(size_t thID)
+{
+    DCHECK_LT(thID, thCon.size());
+    return &thCon[thID]->ctx;
+}
+
+inline uint32_t DSM::get_icon_lkey()
+{
+    return DCHECK_NOTNULL(iCon_)->cacheLKey;
+}
+
+Buffer DSM::get_server_internal_dsm_buffer()
+{
+    size_t buffer_len = dsm_reserve_size();
+    Buffer ret((char *) dsm_base(), buffer_len);
+    return ret;
+}
+Buffer DSM::get_server_buffer()
+{
+    size_t rv = total_reserve_size();
+    Buffer ret((char *) dsm_base() + rv, buffer_size());
+    return ret;
+}
+Buffer DSM::get_server_reserved_buffer()
+{
+    size_t dsm_rv = dsm_reserve_size();
+    size_t buffer_len = user_reserve_size();
+    Buffer ret((char *) dsm_base() + dsm_rv, buffer_len);
+    return ret;
+}
+
+int DSM::try_poll_rdma_cq(size_t count, ibv_wc *wc)
+{
+    return ibv_poll_cq(iCon_->ibcq(), count, wc);
+}
+
+uint64_t DSM::poll_rdma_cq(int count)
+{
+    ibv_wc wc;
+    // dinfo("Polling cq %p", iCon_->cq);
+    pollWithCQ(iCon_->ibcq(), count, &wc);
+
+    return wc.wr_id;
+}
+
+size_t DSM::try_poll_dir_cq(ibv_wc *wcs, size_t dirID, size_t limit)
+{
+    DCHECK_LT(dirID, dirCon.size());
+    return ibv_poll_cq(dirCon[dirID]->ibcq(), limit, wcs);
+}
+
+int DSM::poll_dir_cq(size_t dirID, size_t count)
+{
+    ibv_wc wc;
+    DCHECK_LT(dirID, dirCon.size());
+    return pollWithCQ(dirCon[dirID]->ibcq(), count, &wc);
+}
+
+bool DSM::poll_rdma_cq_once(uint64_t &wr_id)
+{
+    ibv_wc wc;
+    int res = pollOnce(iCon_->ibcq(), 1, &wc);
+
+    wr_id = wc.wr_id;
+
+    return res == 1;
+}
+
+bool DSM::modify_th_qp_access_flag(int node_id, size_t dir_id, uint64_t f)
+{
+    auto *qp = get_th_qp(node_id, dir_id);
+    return modify_qp_access_flag(qp, f);
+}
+bool DSM::modify_dir_qp_access_flag(size_t node_id,
+                                    size_t thread_id,
+                                    size_t dir_id,
+                                    uint64_t f)
+{
+    auto *qp = get_dir_qp(node_id, thread_id, dir_id);
+    return modify_qp_access_flag(qp, f);
+}
+
+bool DSM::modify_qp_access_flag(ibv_qp *qp, uint64_t flags)
+{
+    ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_access_flags = flags;
+    auto ret = ibv_modify_qp(qp, &attr, IBV_QP_ACCESS_FLAGS);
+    if (ret)
+    {
+        DLOG(WARNING) << "[DSM} failed to modify qp access flag. QP: " << qp
+                      << ", flags: " << (uint64_t) flags;
+        return false;
+    }
+    return true;
+}
+
+class DSMSecondaryAllocator : public mem::SecondaryAllocator,
+                              util::MakeShared<DSMSecondaryAllocator>
+{
+public:
+    DSMSecondaryAllocator(DSM *dsm) : dsm_(dsm)
+    {
+    }
+    rdma::MemoryRegion alloc(size_t size) override
+    {
+        return dsm_->create_secondary_mr(size);
+    }
+    void free(const rdma::MemoryRegion &mr) override
+    {
+        return dsm_->free_secondary_mr(mr);
+    }
+
+private:
+    DSM *dsm_;
+};
+
+#endif /* __DSM_H__ */

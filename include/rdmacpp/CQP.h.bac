@@ -1,0 +1,176 @@
+// Concurrent QP
+#pragma once
+
+#include <infiniband/verbs.h>
+#include <infiniband/verbs_exp.h>
+
+#include <atomic>
+
+#include "CoroContext.h"
+#include "Pool.h"
+#include "WRCtx.h"
+#include "util/ASM.h"
+#include "util/Pre.h"
+#include "util/TLS.h"
+
+namespace rdma
+{
+class CQP
+{
+public:
+    using WRCtxT = WRCtx;
+    CQP(ibv_qp *qp, ibv_cq *cq) : qp_(qp), cq_(cq)
+    {
+    }
+
+    void write(const void *source,
+               uint32_t lkey,
+               size_t size,
+               uint64_t dest,
+               uint32_t rkey,
+               CoroContext *ctx)
+    {
+        auto *wrctx = new WRCtxT();
+        wrctx->pp_ = [](void *wrctx) {
+            auto *ctx = (WRCtxT *) wrctx;
+            ctx->ready_->store(true);
+        };
+
+        auto &wr = wrctx->wr(0);
+        auto &sge = wrctx->sge(0);
+
+        memset(&wr, 0, sizeof(wr));
+        if (size)
+        {
+            memset(&sge, 0, sizeof(sge));
+            sge.addr = (uint64_t) source;
+            sge.length = size;
+            sge.lkey = lkey;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+        }
+
+        wr.exp_opcode = IBV_EXP_WR_RDMA_WRITE;
+        // must be signal, since it is concurrent queues
+        wr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = dest;
+        wr.wr.rdma.rkey = rkey;
+        wr.wr_id = (uint64_t) wrctx;
+        wr.next = kNullWr;
+
+        return link_wr(&wr);
+    }
+
+    void link_wr(ibv_exp_send_wr *wr)
+    {
+        DCHECK_EQ(wr->next, kNullWr);
+
+        auto hint_wr = wr_head_.load(std::memory_order_relaxed);
+        while (true)
+        {
+            auto *tail_wr = CHECK_NOTNULL(search_tail_wr(hint_wr, wr));
+            auto &next_atm = *(std::atomic<ibv_exp_send_wr *> *) tail_wr->next;
+            auto expect = kNullWr;
+            if (next_atm.compare_exchange_strong(expect, wr))
+            {
+                // okay
+                return;
+            }
+        }
+    }
+    /**
+     * search_tail_wr return the tail wr in the concurrent link. Return nullptr
+     * if the link is empty.
+     *
+     * The search starts from hint_wr.
+     * If link is empty and insert_wr is not empty, will try to construct a new
+     * link with insert_wr as new head.
+     *
+     */
+    ibv_exp_send_wr *search_tail_wr(ibv_exp_send_wr *hint_wr,
+                                    ibv_exp_send_wr *insert_wr)
+    {
+    retry:
+        ibv_exp_send_wr *cur =
+            hint_wr ? hint_wr : wr_head_.load(std::memory_order_relaxed);
+
+        while (true)
+        {
+            if (likely(cur != nullptr))
+            {
+                break;
+            }
+            else
+            {
+                // is it committing, wait
+                if (insert_wr == nullptr)
+                {
+                    return nullptr;
+                }
+                else
+                {
+                    ibv_exp_send_wr *expect = nullptr;
+                    if (wr_head_.compare_exchange_strong(expect, insert_wr))
+                    {
+                        break;
+                    }
+                }
+            }
+            util::asms::cpu_relax();
+        }
+        while (cur->next != nullptr && cur->next != kNullWr)
+        {
+            cur = cur->next;
+        }
+
+        if (likely(cur->next == kNullWr))
+        {
+            return cur;
+        }
+        // it is committing, wait
+        util::asms::cpu_relax();
+        goto retry;
+    }
+    // condition: only one committer.
+    void commit()
+    {
+        // CAS is not needed: only one committer
+        auto hint_head = wr_head_.load(std::memory_order_relaxed);
+        wr_head_.store(nullptr, std::memory_order_acquire);
+
+        while (true)
+        {
+            auto *tail_wr = search_tail_wr(hint_head, nullptr);
+            hint_head = tail_wr;
+
+            if (unlikely(tail_wr == nullptr))
+            {
+                return;
+            }
+            auto &next_atm = *(std::atomic<ibv_exp_send_wr *> *) tail_wr->next;
+            auto expect = kNullWr;
+            if (next_atm.compare_exchange_strong(expect, nullptr))
+            {
+                break;
+            }
+            util::asms::cpu_relax();
+        }
+        ibv_exp_send_wr *bad_wr{};
+        auto ret = ibv_exp_post_send(
+            qp_, wr_head_.load(std::memory_order_relaxed), &bad_wr);
+        PLOG_IF(FATAL, ret != 0)
+            << "** failed to ibv_post_send. bad: " << *bad_wr;
+    }
+    ibv_cq *cq()
+    {
+        return cq_;
+    }
+
+private:
+    ibv_qp *qp_{};
+    ibv_cq *cq_{};
+
+    std::atomic<ibv_exp_send_wr *> wr_head_{};
+    // std::atomic<ibv_exp_send_wr *> wr_cur_{};
+};
+}  // namespace rdma

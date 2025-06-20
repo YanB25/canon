@@ -1,0 +1,187 @@
+#include <numa.h>
+
+#include <atomic>
+#include <cinttypes>
+#include <thread>
+
+#include "DSMCache.h"
+#include "WRLock.h"
+#include "avis/avis.h"
+#include "bench/experiment.h"
+#include "gflags/gflags.h"
+#include "glog/logging.h"
+#include "memory/dsm_allocator.h"
+#include "util/gflags_def.h"
+
+struct C
+{
+    OnePassBucketMonitor<uint64_t> bucket{0, MAX_MACHINE, 1};
+    std::unique_ptr<avis::AvisHandle> handle;
+};
+
+struct Spec
+{
+    using PCLS = C;
+};
+
+class Experiment : public ::bench::DSMCoroExperiment<Spec>
+{
+public:
+    using Base = ::bench::DSMCoroExperiment<Spec>;
+    using BLS = typename Base::BLS;
+    Experiment(const avis::Config &avis_config) : avis_config_(avis_config)
+    {
+        DSMConfig dsm_config;
+        dsm_config.worker_nr = 0;
+        dsm_ = DSM::getInstance(dsm_config);
+        dsm_->registerThread();
+
+        auto primary_alloc = dsm_->get_dsm_allocator();
+        auto secondary_alloc = dsm_->get_secondary_allocator();
+
+        auto provider_id = dsm_->get_node_id();
+        m_ = std::make_unique<avis::AvisManager>(provider_id,
+                                                 primary_alloc,
+                                                 secondary_alloc,
+                                                 dsm_,
+                                                 avis_config_,
+                                                 1 /* init pool nr */);
+        auto *meta = m_->meta_addr();
+        dsm_->put("meta", meta, 100ms);
+        auto *get_meta = dsm_->get<avis::AvisMeta *>("meta", 100ms);
+
+        providers_.emplace_back(Provider{
+            .node_id = (uint32_t) dsm_->get_node_id(),
+            .rkey = dsm_->get_rkey(dsm_->get_node_id(), 0 /* dir_id */),
+            .meta_addr = (uint64_t) get_meta});
+    }
+    DSM::pointer get_dsm() const override
+    {
+        return dsm_;
+    }
+
+    void thread_init(BLS &bls, size_t thread_nr) override
+    {
+        dsm_->registerThread();
+
+        Base::thread_init(bls, thread_nr);
+    }
+    void benchmark_coroutine(BLS &bls,
+                             const Config &conf,
+                             [[maybe_unused]] CoroContext &ctx,
+                             ::bench::StopToken::pointer token,
+                             bool) override
+    {
+        auto &pcls = bls.persistent_coroutine();
+
+        size_t alloc_size = conf.get<size_t>("alloc_size");
+        bool with_alloc = conf.get<bool>("with_alloc");
+        auto policy = conf.get<avis::Policy>("policy");
+
+        pcls.handle = std::make_unique<avis::AvisHandle>(
+            dsm_, avis_config_, providers_, policy, &ctx);
+        pcls.handle->update_metas();
+
+        auto &handle = pcls.handle;
+        auto rdma_buf = handle->dsm()->get_rdma_buffer(alloc_size);
+        auto addr = handle->alloc(alloc_size);
+
+        while (!token->stop_requested())
+        {
+            avis::AvisAddress cur_addr;
+            if (with_alloc)
+            {
+                cur_addr = handle->alloc(alloc_size);
+            }
+            else
+            {
+                cur_addr = addr;
+            }
+
+            if (likely(!addr.is_null()))
+            {
+                handle->prepare_read(rdma_buf.buffer, cur_addr, alloc_size);
+                handle->commit();
+
+                allocated_nr_.current()++;
+                token->complete_task(1);
+            }
+        }
+    }
+    void on_thread_start_bench(BLS &bls, const Config &conf) override
+    {
+        alloc.current() = std::make_shared<memory::DSMAllocator>(dsm_.get());
+        Base::on_thread_start_bench(bls, conf);
+    }
+    void on_coro_end_bench(BLS &bls, const Config &conf) override
+    {
+        auto &pcls = bls.persistent_coroutine();
+        pcls.handle.reset();
+
+        Base::on_thread_end_bench(bls, conf);
+    }
+
+    void on_start_bench(BLS &bls, const Config &conf) override
+    {
+        allocated_nr_.fill(0);
+        Base::on_start_bench(bls, conf);
+    }
+
+    void on_end_bench(const ::bench::ResultRecord &res,
+                      BLS &bls,
+                      const Config &conf) override
+    {
+        auto sum = allocated_nr_.accumulate(
+            [](auto acc, auto cur) { return acc + cur; }, 0);
+        auto byte = conf.get<size_t>("alloc_size") * sum;
+        LOG(INFO) << "Allocated " << util::pre_num(sum) << ", i.e., "
+                  << util::pre_byte(byte) << "(" << byte << ")";
+        m_->force_reset();
+
+        Base::on_end_bench(res, bls, conf);
+    }
+
+    void exit() override
+    {
+        // for (size_t p = 0; p < m_->pool_nr(); ++p)
+        // {
+        //     LOG(INFO) << m_->explain_pool(p);
+        // }
+        Base::exit();
+    }
+
+private:
+    DSM::pointer dsm_;
+    Perthread<std::shared_ptr<memory::DSMAllocator>> alloc;
+
+    std::unique_ptr<avis::AvisManager> m_;
+
+    const avis::Config &avis_config_;
+    using Provider = avis::AvisHandle::Provider;
+    std::vector<Provider> providers_;
+
+    Perthread<size_t> allocated_nr_;
+};
+
+int main(int argc, char *argv[])
+{
+    init_gflags(argc, argv);
+    avis::Config avis_config;
+    Experiment exp(avis_config);
+
+    bench::ConfigFactory f;
+    // f.configure_thread_nr({1, 4, 8, 16, kMaxAppThread});
+    f.configure_thread_nr({1, 4, 8});
+    f.configure_coro_nr({1});
+    // f.add_option<size_t>("alloc_size", {4_KB, 1_MB});
+    f.add_option<size_t>("alloc_size", {4_KB});
+    f.add_option<bool>("with_alloc", {true, false});
+    auto pf = avis::PolicyFactory{};
+    f.add_option<avis::Policy>("policy", {pf.default_policy()});
+    auto configs = f.generate_configs();
+
+    exp.configure_monitor(100ms, 20);
+    exp.launch_coroutines(configs);
+
+    LOG(INFO) << "PASS.";
+}

@@ -1,0 +1,431 @@
+#include <numa.h>
+
+#include <thread>
+#include <vector>
+
+#include "GlobalAddress.h"
+#include "avis/avis.h"
+#include "avis/mm.h"
+#include "bench/experiment.h"
+#include "gflags/gflags.h"
+#include "glog/logging.h"
+#include "util/Bitset.h"
+#include "util/gflags_def.h"
+
+using namespace avis;
+
+template <typename T>
+inline auto random_evict(std::unordered_set<T> &set)
+{
+    DCHECK(!set.empty());
+    auto it = set.begin();
+    size_t limit = set.size();
+    auto adv = fast_pseudo_rand_int(0, limit - 1);
+    std::advance(it, adv);
+    auto ret = *it;
+    set.erase(it);
+    return ret;
+}
+
+inline void validate_buffer_not_overlapped(const avis::AvisAddress &lhs,
+                                           const avis::AvisAddress &rhs,
+                                           size_t size)
+{
+    Buffer lhs_buf((char *) (uint64_t) lhs.offset(), size);
+    Buffer rhs_buf((char *) (uint64_t) rhs.offset(), size);
+    validate_buffer_not_overlapped(lhs_buf, rhs_buf);
+}
+
+inline void validate_buffer_not_overlapped(
+    const std::unordered_set<avis::AvisAddress> &set, size_t size)
+{
+    for (auto it = set.begin(); it != set.end(); ++it)
+    {
+        for (auto it2 = std::next(it); it2 != set.end(); ++it2)
+        {
+            validate_buffer_not_overlapped(*it, *it2, size);
+        }
+    }
+}
+
+void validate_utilization(avis::AvisManager *m,
+                          avis::AvisHandle *handle,
+                          avis::AvisAddress addr,
+                          size_t allocated_bytes,
+                          const avis::Policy &p)
+{
+    auto pos = handle->position_from_addr(addr);
+    auto [pool_id, block, slot, page] = pos.baseline;
+    CHECK_EQ(p.allocator_type_, AllocatorType::kBaseline);
+    auto uti = m->explain_pool(pool_id).utilization();
+    double expect_uti =
+        1.0 * allocated_bytes / handle->layout().total_buffer_size();
+    // CHECK_DOUBLE_EQ(uti, expect_uti);
+    CHECK_NEAR(uti, expect_uti, 0.0001);
+}
+
+void test_template(avis::AvisManager *m,
+                   avis::AvisHandle *handle,
+                   size_t alloc_size,
+                   ssize_t ongoing_nr,
+                   ssize_t test_limit,
+                   bool enable_free,
+                   bool validate_util,
+                   bool validate_overlap)
+
+{
+    std::unordered_set<avis::AvisAddress> addrs;
+    ssize_t allocated_bytes = 0;
+    ssize_t allocated_nr = 0;
+    ssize_t acc_allocated_nr = 0;
+    avis::AvisAddress example_addr;
+    while (true)
+    {
+        auto addr = handle->alloc(alloc_size);
+        if (unlikely(addr.is_null()))
+        {
+            LOG(INFO) << "Full: " << addr;
+            break;
+        }
+        example_addr = addr;
+        if (enable_free)
+        {
+            CHECK(addrs.emplace(addr).second);
+        }
+        allocated_bytes += alloc_size;
+        allocated_nr++;
+        acc_allocated_nr++;
+
+        if (acc_allocated_nr > test_limit)
+        {
+            break;
+        }
+
+        if (validate_util)
+        {
+            validate_utilization(
+                m, handle, addr, allocated_bytes, handle->policy());
+        }
+
+        if (allocated_nr >= ongoing_nr)
+        {
+            if (enable_free)
+            {
+                auto e = random_evict(addrs);
+                CHECK_LT(addrs.size(), ongoing_nr);
+                handle->free(e, alloc_size);
+                allocated_bytes -= alloc_size;
+                allocated_nr--;
+
+                if (validate_util)
+                {
+                    validate_utilization(
+                        m, handle, e, allocated_bytes, handle->policy());
+                }
+            }
+            else
+            {
+                // not enable free, exit
+                LOG(INFO) << PRE(allocated_nr) << " >= " << PRE(ongoing_nr);
+                break;
+            }
+        }
+
+        if (validate_overlap)
+        {
+            validate_buffer_not_overlapped(addrs, alloc_size);
+        }
+    }
+
+    auto [pool, block, slot, frame] =
+        handle->position_from_addr(example_addr).baseline;
+    CHECK_EQ(handle->policy().allocator_type_, AllocatorType::kBaseline);
+    LOG(INFO) << PRE(pool) << ", " << PRE(block) << ", " << PRE(slot) << ", "
+              << PRE(frame);
+    LOG(INFO) << m->explain_pool(pool);
+
+    validate_utilization(
+        m, handle, example_addr, allocated_bytes, handle->policy());
+}
+
+[[maybe_unused]] constexpr auto MAX = std::numeric_limits<ssize_t>::max();
+
+void test_alloc_huge_base(avis::AvisHandle *handle,
+                          const avis::Config &conf,
+                          size_t limit)
+{
+    std::vector<Buffer> buffers;
+    std::vector<avis::AvisAddress> addrs;
+    std::vector<uint64_t> raw_addrs;
+    LOG(INFO) << "base";
+    for (size_t i = 0; i < limit / 2; ++i)
+    {
+        size_t alloc_size = conf.base_frame_size;
+        auto addr = handle->alloc(alloc_size);
+        if (unlikely(addr.is_null()))
+        {
+            break;
+        }
+        addrs.push_back(addr);
+        buffers.emplace_back((char *) (uint64_t) addr.offset(), alloc_size);
+        raw_addrs.push_back(addr.offset());
+    }
+    LOG(INFO) << "huge";
+    for (size_t i = 0; i < limit; ++i)
+    {
+        size_t alloc_size = conf.huge_frame_size;
+        auto addr = handle->alloc(alloc_size);
+        if (unlikely(addr.is_null()))
+        {
+            break;
+        }
+        addrs.push_back(addr);
+        buffers.emplace_back((char *) (uint64_t) addr.offset(), alloc_size);
+        raw_addrs.push_back(addr.offset());
+    }
+
+    LOG(INFO) << "Begin validating...";
+    validate_buffer_not_overlapped(buffers);
+    LOG(INFO) << "Allocated " << PRE(buffers.size());
+
+    std::sort(raw_addrs.begin(), raw_addrs.end());
+    LOG(INFO) << "min: " << (void *) raw_addrs.front()
+              << ", max: " << (void *) raw_addrs.back() << ", expect_max: "
+              << (void *) std::numeric_limits<uint32_t>::max();
+}
+
+struct Ctx
+{
+    Ctx(DSM::pointer dsm,
+        const avis::Config &config,
+        const std::vector<Provider> &providers,
+        std::unique_ptr<avis::AvisManager> manager,
+        std::unique_ptr<avis::AvisHandle> handle,
+        const avis::Policy &policy)
+        : dsm(dsm),
+          config(config),
+          providers(providers),
+          manager(std::move(manager)),
+          handle(std::move(handle)),
+          policy_(policy)
+    {
+    }
+    void reset()
+    {
+        manager->force_reset();
+        handle = std::make_unique<avis::AvisHandle>(
+            dsm, config, providers, policy_, nullptr);
+        handle->update_metas();
+    }
+    auto *m()
+    {
+        return manager.get();
+    }
+    auto *h()
+    {
+        return handle.get();
+    }
+    const auto &conf() const
+    {
+        return config;
+    }
+    const auto &layout() const
+    {
+        return manager->layout();
+    }
+
+    DSM::pointer dsm;
+    const avis::Config &config;
+    const std::vector<Provider> &providers;
+
+    std::unique_ptr<avis::AvisManager> manager;
+    std::unique_ptr<avis::AvisHandle> handle;
+
+    avis::Policy policy_;
+};
+
+void test(Ctx &ctx)
+{
+    const auto &conf = ctx.conf();
+    const auto &layout = ctx.m()->layout();
+
+    [[maybe_unused]] auto total_sz = layout.total_buffer_size();
+    [[maybe_unused]] auto huge_nr = total_sz / conf.huge_frame_size;
+    [[maybe_unused]] auto base_nr = total_sz / conf.base_frame_size;
+
+    LOG(INFO) << "allocate until full";
+    ctx.reset();
+    test_template(
+        ctx.m(), ctx.h(), conf.huge_frame_size, MAX, MAX, false, false, false);
+
+    LOG(INFO) << "validate overlap";
+    ctx.reset();
+    test_template(ctx.m(),
+                  ctx.h(),
+                  conf.huge_frame_size,
+                  16 * 1024,
+                  MAX,
+                  false,
+                  false,
+                  true);
+
+    LOG(INFO) << "validate overlap & util";
+    ctx.reset();
+    test_template(ctx.m(),
+                  ctx.h(),
+                  conf.huge_frame_size,
+                  16 * 1024,
+                  MAX,
+                  false,
+                  true,
+                  true);
+
+    LOG(INFO) << "validate overlap & util with free";
+    ctx.reset();
+    test_template(ctx.m(),
+                  ctx.h(),
+                  conf.huge_frame_size,
+                  128,
+                  16 * 1024,
+                  true,
+                  true,
+                  true);
+
+    LOG(INFO) << "[base] validate overlap";
+    ctx.reset();
+    test_template(ctx.m(),
+                  ctx.h(),
+                  conf.base_frame_size,
+                  32 * 1024,
+                  MAX,
+                  false,
+                  false,
+                  true);
+
+    LOG(INFO) << "[base] validate overlap & util";
+    ctx.reset();
+    test_template(ctx.m(),
+                  ctx.h(),
+                  conf.base_frame_size,
+                  32 * 1024,
+                  MAX,
+                  false,
+                  true,
+                  true);
+
+    LOG(INFO) << "[base] validate overlap & util with free";
+    ctx.reset();
+    test_template(ctx.m(),
+                  ctx.h(),
+                  conf.base_frame_size,
+                  128,
+                  8 * 1024,
+                  true,
+                  true,
+                  true);
+
+    LOG(INFO) << "validate mixed";
+    ctx.reset();
+    test_alloc_huge_base(ctx.h(), conf, 64 * 1024);
+}
+
+auto make_handle(DSM::pointer dsm, const avis::Config &avis_config)
+{
+    std::vector<Provider> providers;
+    auto *get_meta = dsm->get<avis::AvisMeta *>("meta", 100ms);
+    providers.emplace_back(
+        Provider{.node_id = (uint32_t) dsm->get_node_id(),
+                 .rkey = dsm->get_rkey(dsm->get_node_id(), 0 /* dir_id */),
+                 .meta_addr = (uint64_t) get_meta});
+
+    auto pf = avis::PolicyFactory{};
+    auto policy = pf.default_policy();
+    auto handle = std::make_unique<avis::AvisHandle>(
+        dsm, avis_config, providers, policy, nullptr);
+    handle->update_metas();
+
+    return handle;
+}
+
+int main(int argc, char *argv[])
+{
+    init_gflags(argc, argv);
+
+    DSMConfig dsm_config;
+    dsm_config.worker_nr = 0;
+    auto dsm = DSM::getInstance(dsm_config);
+    dsm->registerThread();
+
+    auto primary_alloc = dsm->get_dsm_allocator();
+    auto secondary_alloc = dsm->get_secondary_allocator();
+    avis::Config config;
+
+    auto provider_id = dsm->get_node_id();
+    auto m = std::make_unique<avis::AvisManager>(provider_id,
+                                                 primary_alloc,
+                                                 secondary_alloc,
+                                                 dsm,
+                                                 config,
+                                                 1 /* init pool nr*/);
+
+    auto *meta = m->meta_addr();
+    dsm->put("meta", meta, 100ms);
+
+    auto handle_lhs = make_handle(dsm, config);
+    auto handle_rhs = make_handle(dsm, config);
+    std::vector<avis::AvisAddress> lhs_addr;
+    std::vector<avis::AvisAddress> rhs_addr;
+
+    LOG(INFO) << "Start allocation";
+    while (true)
+    {
+        auto lhs = handle_lhs->alloc(config.base_frame_size);
+        auto rhs = handle_rhs->alloc(config.base_frame_size);
+        if (lhs)
+        {
+            lhs_addr.push_back(lhs);
+        }
+        if (rhs)
+        {
+            rhs_addr.push_back(rhs);
+        }
+        if (!lhs || !rhs)
+        {
+            break;
+        }
+    }
+    LOG(INFO) << PRE(lhs_addr.size(), rhs_addr.size());
+    LOG(INFO) << "Start freeing";
+    while (!lhs_addr.empty() && !rhs_addr.empty())
+    {
+        auto lhs_e = lhs_addr.back();
+        lhs_addr.pop_back();
+        auto rhs_e = rhs_addr.back();
+        rhs_addr.pop_back();
+        handle_lhs->free(lhs_e, config.base_frame_size);
+        handle_rhs->free(rhs_e, config.base_frame_size);
+    }
+    while (!lhs_addr.empty())
+    {
+        auto lhs_e = lhs_addr.back();
+        lhs_addr.pop_back();
+        handle_lhs->free(lhs_e, config.base_frame_size);
+    }
+    while (!rhs_addr.empty())
+    {
+        auto rhs_e = rhs_addr.back();
+        rhs_addr.pop_back();
+        handle_rhs->free(rhs_e, config.base_frame_size);
+    }
+    LOG(INFO) << "Okay, try again";
+
+    for (size_t i = 0; i < 64; ++i)
+    {
+        auto left = handle_lhs->alloc(config.base_frame_size);
+        LOG(INFO) << PRE(i, left);
+        auto right = handle_rhs->alloc(config.base_frame_size);
+        LOG(INFO) << PRE(i, right);
+    }
+
+    LOG(INFO) << "PASS.";
+}

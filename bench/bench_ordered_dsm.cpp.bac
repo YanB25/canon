@@ -1,0 +1,205 @@
+#include <numa.h>
+
+#include <atomic>
+#include <cinttypes>
+#include <thread>
+
+#include "DSMCache.h"
+#include "WRLock.h"
+#include "bench/experiment.h"
+#include "gflags/gflags.h"
+#include "glog/logging.h"
+#include "memory/dsm_allocator.h"
+#include "rdmacpp/WRCtx.h"
+#include "util/TLS.h"
+#include "util/gflags_def.h"
+
+using namespace rdma;
+
+struct ThreadContext
+{
+    GlobalAddress gaddr;
+};
+struct Spec
+{
+    using PTLS = ThreadContext;
+    struct TLS
+    {
+        size_t op{};
+    };
+};
+
+class Experiment : public ::bench::DSMCoroExperiment<Spec>
+{
+public:
+    using Base = ::bench::DSMCoroExperiment<Spec>;
+    using BLS = typename Base::BLS;
+    Experiment()
+    {
+        DSMConfig config;
+        config.worker_nr = 0;
+        dsm_ = DSM::getInstance(config);
+        dsm_->registerThread();
+    }
+    void thread_init(BLS &bls, size_t thread_nr) override
+    {
+        dsm_->registerThread();
+        auto &ptlc = bls.persistent_thread();
+        ptlc.gaddr = dsm_->alloc(4_KB);
+        LOG(INFO) << "Address is " << ptlc.gaddr;
+        Base::thread_init(bls, thread_nr);
+    }
+    DSM::pointer get_dsm() const override
+    {
+        return dsm_;
+    }
+    void on_thread_end_bench(BLS &bls, const Config &conf) override
+    {
+        // LOG(INFO) << "Tid " << util::get_thread_id() << ": " <<
+        // bls.thread().op;
+        Base::on_thread_end_bench(bls, conf);
+    }
+
+    void on_start_bench(BLS &bls, const Config &conf) override
+    {
+        // for (auto &m : dsm_->ordered_dist())
+        // {
+        //     m = 0;
+        // }
+        Base::on_start_bench(bls, conf);
+    }
+    void on_end_bench(const ResultRecord &r,
+                      StorageT &s,
+                      const Config &c) override
+    {
+        // LOG(ERROR) << PRE(dsm_->ordered_dist());
+        Base::on_end_bench(r, s, c);
+    }
+
+    void benchmark_master(BLS &,
+                          const Config &conf,
+                          CoroContext &mctx,
+                          ::bench::StopToken::pointer token,
+                          bool) override
+    {
+        // LOG(WARNING) << PRE(mctx) << " master enter!!";
+        size_t total_coro_nr = conf.effective_client_nr();
+        size_t coro_nr = conf.coro_nr();
+
+        finished_coro_.current().clear();
+        finished_coro_.current().resize(coro_nr, false);
+        finished_nr_.current() = 0;
+
+        auto &_dsm = this->__dsm();
+
+        for (size_t i = 0; i < coro_nr; ++i)
+        {
+            mctx.yield_to_worker(i);
+        }
+
+        auto *cq = _dsm.get_icon_cq();
+        ibv_wc wcs[64];
+
+        // auto then = std::chrono::steady_clock::now();
+        while (total_finished_nr_.load(std::memory_order_relaxed) <
+               total_coro_nr)
+        {
+            // first, post_send
+            auto *icon = _dsm.get_icon();
+            auto dir_id = 0;
+            for (size_t i = 0; i < _dsm.getClusterSize(); ++i)
+            {
+                auto &cqp = icon->cQPs[dir_id][i];
+                cqp->commit();
+            }
+
+            auto ret = ibv_poll_cq(cq, 64, wcs);
+            // LOG(INFO) << "Polling CQ " << PRE(cq) << ", " << PRE(ret);
+            PLOG_IF(FATAL, ret < 0) << "** failed to poll cq";
+            for (int i = 0; i < ret; ++i)
+            {
+                auto &wc = wcs[i];
+
+                auto wr_id = wc.wr_id;
+                WRCtx<int> &wrctx = *(WRCtx<int> *) wr_id;
+                if (unlikely(wc.status != IBV_WC_SUCCESS))
+                {
+                    LOG(WARNING) << PRE(wc);
+                    LOG(WARNING) << PRE(wrctx);
+                }
+                if (wrctx.pp_)
+                {
+                    wrctx.pp_(&wrctx);
+                }
+            }
+
+            while (true)
+            {
+                auto next = mctx.next_hot_waiting_coro();
+                if (next)
+                {
+                    mctx.yield_to_worker(*next);
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+        // LOG(ERROR) << PRE(mctx) << " exit...";
+
+        CHECK(token->stop_requested());
+    }
+
+    void benchmark_coroutine(BLS &bls,
+                             const Config &conf,
+                             CoroContext &ctx,
+                             ::bench::StopToken::pointer token,
+                             bool) override
+    {
+        // LOG(INFO) << PRE(ctx) << " enter !!!";
+        auto &ptls = bls.persistent_thread();
+        [[maybe_unused]] auto &tls = bls.thread();
+        auto dsm = get_dsm();
+        auto io_size = conf.get<size_t>("io_size");
+        [[maybe_unused]] auto batch_size = conf.get<size_t>("batch_size");
+        [[maybe_unused]] auto thread_nr = conf.thread_nr();
+        [[maybe_unused]] auto tid = util::get_thread_id();
+        auto id = ctx.coro_id() + tid * define::kMaxCoroNr;
+        auto rdma_buffer = dsm->get_rdma_buffer(io_size);
+        memset(rdma_buffer.buffer, 'a' + id, io_size);
+        while (!token->stop_requested())
+        {
+            auto addr =
+                ptls.gaddr + fast_pseudo_rand_int(0, 6_GB / io_size) * io_size;
+            dsm->ordered_write(
+                rdma_buffer.buffer, addr, io_size, thread_nr, &ctx);
+            token->complete_task(1);
+        }
+        dsm->put_rdma_buffer(std::move(rdma_buffer));
+    }
+
+private:
+    DSM::pointer dsm_;
+    std::vector<void *> huge_pages_;
+};
+
+int main(int argc, char *argv[])
+{
+    init_gflags(argc, argv);
+    Experiment exp;
+
+    bench::ConfigFactory f;
+    // f.configure_thread_nr({1, 4, 8, 16});
+    // f.configure_thread_nr({kMaxAppThread});
+    f.configure_thread_nr({2, 4, 8, 12, 16, 24, kMaxAppThread});
+    f.configure_coro_nr({4});
+    f.add_option<size_t>("io_size", {8});
+    f.add_option<size_t>("batch_size", {4});
+    auto configs = f.generate_configs();
+
+    exp.configure_monitor(200ms, 4);
+    exp.launch_coroutines(configs);
+
+    LOG(INFO) << "PASS.";
+}

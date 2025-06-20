@@ -1,0 +1,461 @@
+#include <chrono>
+#include <thread>
+
+#include "Common.h"
+#include "DSM.h"
+#include "GlobalAddress.h"
+#include "avis/avis.h"
+#include "avis/bench/hashtable.h"
+#include "avis/dump.h"
+#include "avis/handle.h"
+#include "avis/publisher.h"
+#include "bench/experiment.h"
+#include "bench/request.h"
+#include "gflags/gflags.h"
+#include "glog/logging.h"
+#include "sherman/Tree.h"
+#include "thirdparty/racehashing/hashtable.h"
+#include "thirdparty/racehashing/race.h"
+#include "thirdparty/racehashing/utils.h"
+#include "util/PerformanceReporter.h"
+#include "util/PreUtil.h"
+#include "util/Rand.h"
+#include "util/gflags_dec.h"
+#include "util/gflags_def.h"
+
+using namespace patronus::hash;
+
+constexpr static size_t kE = 1;
+constexpr static size_t kB = 32;
+// constexpr static size_t kE = 64;
+// constexpr static size_t kB = 1024 * 8;
+constexpr static size_t kS = 8;
+
+using Provider = avis::BuddyProvider;
+
+// using RaceHashingT = RaceHashing<kE, kB, kS>;
+// using HandleT = typename RaceHashingT::Handle;
+using TableT = RaceHashing<kE, kB, kS>;
+
+using HashTableT = HashTable<kE, kB, kS>;
+using HashClientT = HashClient<kE, kB, kS>;
+
+// tid to config
+using CombineConfig = std::map<size_t, bench::RequestGenerator::Config>;
+
+DEFINE_uint32(thread_nr, 32, "Number of Thread");
+DEFINE_uint32(coro_nr, 1, "Number of coroutine");
+
+enum Phase
+{
+    kInsert,
+    kHalfDel,
+};
+
+struct Spec
+{
+    struct CLS
+    {
+        std::shared_ptr<HashClientT> handle_;
+    };
+};
+
+struct Dist
+{
+    double put_rate;
+    double del_rate;
+};
+inline std::ostream &operator<<(std::ostream &os, const Dist &d)
+{
+    os << fmt::format("{}-{}", d.put_rate, d.del_rate);
+    return os;
+}
+
+class Experiment : public ::bench::DSMCoroExperiment<Spec>
+{
+public:
+    using Base = ::bench::DSMCoroExperiment<Spec>;
+    using BLS = typename Base::BLS;
+
+    using Provider = avis::BuddyProvider;
+    Experiment(const DSMConfig &config)
+    {
+        dsm_ = DSM::getInstance(config);
+        dsm_->registerThread();
+
+        server_nid_ = dsm_->getClusterSize() - 1;
+
+        if (is_server())
+        {
+            table_ = std::make_shared<HashTableT>(dsm_, 50 /* buddy_nr */);
+            // sync providers
+            auto providers = table_->providers();
+            dsm_->put("size", (uint32_t) providers.size(), 100ms);
+            dsm_->put("providers",
+                      providers.data(),
+                      providers.size() * sizeof(Provider),
+                      100ms);
+            dsm_->put("race_meta", table_->meta(), 100ms);
+        }
+        auto size = dsm_->get<uint32_t>("size", 100ms);
+        race_meta_ = dsm_->get<GlobalAddress>("race_meta", 100ms);
+        providers_.resize(size);
+        auto *raw = dsm_->get_raw("providers", 100ms);
+        memcpy(providers_.data(), raw, providers_.size() * sizeof(Provider));
+
+        pub_meta_ = dsm_->get<GlobalAddress>("pub", 100ms);
+        pub_size_ = dsm_->get<size_t>("pub_size", 100ms);
+    }
+    DSM::pointer get_dsm() const override
+    {
+        return dsm_;
+    }
+    bool is_server() const
+    {
+        return dsm_->get_node_id() == server_nid_;
+    }
+    bool is_client() const
+    {
+        return !is_server();
+    }
+    void on_start_bench(BLS &bls, const Config &conf) override
+    {
+        Base::on_start_bench(bls, conf);
+    }
+    void init_client(BLS &bls, const Config &config, CoroContext *ctx)
+    {
+        auto &cls = bls.coroutine();
+        auto request_config =
+            config.get<bench::RequestGenerator::Config>("request_config");
+        HashClientT::BenchConfig conf{
+            .g = bench::RequestGenerator(request_config), .en_validate = false};
+
+        cls.handle_ = std::make_shared<HashClientT>(dsm_,
+                                                    providers_,
+                                                    race_meta_,
+                                                    pub_meta_,
+                                                    pub_size_,
+                                                    conf,
+                                                    server_nid_,
+                                                    ctx);
+    }
+    void benchmark_coroutine(BLS &bls,
+                             const Config &conf,
+                             CoroContext &ctx,
+                             ::bench::StopToken::pointer token,
+                             bool) override
+    {
+        if (is_server())
+        {
+            token->core().request_stop();
+        }
+        auto &cls = bls.coroutine();
+        auto &id = bls.id();
+        bool is_master = id.is_master_thread() && id.is_master_worker_coro();
+
+        const auto &request_config =
+            conf.get<bench::RequestGenerator::Config>("request_config");
+        bool verbose = conf.get<bool>("verbose");
+        auto [put_rate, get_rate, del_rate] = request_config.put_get_del;
+
+        auto limit = request_config.limit;
+
+        init_client(bls, conf, &ctx);
+
+        ChronoTimer timer(is_master /* enable */);
+
+        auto &handle = cls.handle_;
+
+        auto min = std::chrono::nanoseconds(0ns).count();
+        auto max = std::chrono::nanoseconds(100ms).count();
+        auto step = std::chrono::nanoseconds(1us).count();
+        OnePassBucketMonitor<uint64_t> lat_put(min, max, step);
+        OnePassBucketMonitor<uint64_t> lat_get(min, max, step);
+        OnePassBucketMonitor<uint64_t> lat_del(min, max, step);
+
+        size_t failed_nr = 0;
+        size_t ok_nr = 0;
+
+        while (!token->stop_requested())
+        {
+            if (is_client())
+            {
+                double select = fast_pseudo_rand_dbl(0, 1);
+                bool is_put = select < put_rate;
+                bool is_get = select < (put_rate + get_rate);
+                bool is_del = true;
+
+                timer.pin();
+
+                if (is_put)
+                {
+                    auto rc = handle->random_put();
+                    auto ns = timer.pin();
+                    if (rc == RC::kOk)
+                    {
+                        ok_nr++;
+                        if (is_master)
+                        {
+                            lat_put.collect(ns);
+                        }
+                        token->complete_task(1);
+                    }
+                    if (rc == RC::kNoMem)
+                    {
+                        if (failed_nr++ >= 1_K)
+                        {
+                            LOG(INFO) << "[bench] get " << PRE(rc) << ": exit";
+                            token->core().request_stop();
+                        }
+                    }
+                }
+                else if (is_get)
+                {
+                    auto rc = handle->random_get();
+                    auto ns = timer.pin();
+                    if (is_master)
+                    {
+                        lat_get.collect(ns);
+                    }
+                    if (rc == RC::kOk)
+                    {
+                        ok_nr++;
+                        token->complete_task(1);
+                    }
+                }
+                else
+                {
+                    DCHECK(is_del);
+                    auto rc = handle->random_del();
+                    auto ns = timer.pin();
+                    if (is_master)
+                    {
+                        lat_del.collect(ns);
+                    }
+                    if (rc == RC::kOk)
+                    {
+                        ok_nr++;
+                        token->complete_task(1);
+                    }
+                    if (rc == RC::kNotFound)
+                    {
+                        if (failed_nr++ >= 1_K)
+                        {
+                            LOG(INFO) << "[bench] del " << PRE(rc)
+                                      << ": table is empty: exit";
+                            token->core().request_stop();
+                        }
+                    }
+                }
+                if (ok_nr >= limit)
+                {
+                    LOG(INFO) << "[bench] reach limit " << limit << ": exit.";
+                    break;
+                }
+            }
+        }
+        if (is_master)
+        {
+            LOG(INFO) << PRE(lat_put);
+            LOG(INFO) << PRE(lat_get);
+            LOG(INFO) << PRE(lat_del);
+            LOG(INFO) << "Operation: " << PRE(handle->metric());
+            auto [_, rm] = handle->get_adaptor()->metrics();
+            LOG(INFO) << "Total RDMA: " << rm;
+            LOG(INFO) << "PTL induced RDMA: "
+                      << handle->get_handle()->ptl()->metric();
+            LOG(INFO) << "BP induced RDMA: "
+                      << handle->get_handle()->ptl()->bp_metric();
+            LOG_IF(INFO, verbose)
+                << "In cache: " << handle->get_handle()->dump();
+
+            if (avis::Config::ins().use_partition_allocator())
+            {
+                LOG(INFO) << "Partitions: "
+                          << handle->get_adaptor()->partition_metric();
+            }
+
+            auto [allc_metrics, rem_metrics] = handle->get_handle()->metrics();
+            LOG(INFO) << PRE(rem_metrics);
+        }
+    }
+
+    void on_end_bench(const ResultRecord &res,
+                      BLS &bls,
+                      const Config &conf) override
+    {
+        LOG(INFO) << "Dumping memory... (this may take one minute)";
+        bool verbose = conf.get<bool>("verbose");
+        static size_t idx = 0;
+        idx++;
+        if (is_server())
+        {
+            LOG(INFO) << *table_->table();
+            dsm_->put("utilization-" + std::to_string(idx),
+                      (double) table_->table()->utilization(),
+                      100ms);
+        }
+        auto request_config =
+            conf.get<bench::RequestGenerator::Config>("request_config");
+        double avg_size = 0;
+        for (const auto &[size, pob] : request_config.value_size_dist)
+        {
+            avg_size += 1.0 * size * pob;
+        }
+        double table_util =
+            dsm_->get<double>("utilization-" + std::to_string(idx), 100ms);
+        if (is_client())
+        {
+            auto dumper = std::make_shared<avis::Dumper>(dsm_, providers_);
+            dumper->report(verbose);
+            auto [used, total] = dumper->bitmap_utilizations();
+            LOG(INFO) << "Bitmap Usage: " << util::pre_byte(used) << " / "
+                      << util::pre_byte(total) << " (" << used * 100.0 / total
+                      << "% )";
+            LOG(INFO) << pre_rh_explain<kE, kB, kS>{};
+
+            // for hash table
+            auto total_cap = TableT::max_capacity();
+            size_t entry_size = avg_size;
+            // calculate avg entry size
+            auto maybe_total_bytes = total_cap * entry_size * table_util;
+            LOG(INFO) << "Table capacity (maybe): "
+                      << util::pre_byte(maybe_total_bytes) << " with util "
+                      << 100.0 * table_util << "%";
+            double client_pcnt =
+                100.0 * (used - maybe_total_bytes) / maybe_total_bytes;
+            LOG(INFO) << "Client holding: " << util::pre_byte(used) << "(+"
+                      << client_pcnt << "%)";
+            double bitmap_pcnt =
+                100.0 * (total - maybe_total_bytes) / maybe_total_bytes;
+            LOG(INFO) << "Bitmap occupies: " << util::pre_byte(total) << "(+"
+                      << bitmap_pcnt << "%)";
+        }
+        Base::on_end_bench(res, bls, conf);
+    }
+
+private:
+    DSM::pointer dsm_;
+    GlobalAddress race_meta_;
+
+    GlobalAddress pub_meta_;
+    size_t pub_size_;
+
+    size_t server_nid_;
+    std::vector<Provider> providers_;
+
+    // server only
+    std::shared_ptr<HashTableT> table_;
+
+    // bench::ResultDataFrame lat_df_;
+};
+
+int main(int argc, char *argv[])
+{
+    init_gflags(argc, argv);
+
+    DSMConfig config;
+    config.relaxed_ordering = false;
+    if (std::stoi(FLAGS_node_id) == FLAGS_machine_nr - 1)
+    {
+        config.dsmSize = 140_GB;
+    }
+    else
+    {
+        config.dsmSize = 16_GB;
+    }
+    // config.dsmSize = 100_GB;
+
+    Experiment exp(config);
+
+    ::bench::ConfigFactory f;
+
+    auto total_cap = TableT::max_capacity();
+
+    f.configure_thread_nr({FLAGS_thread_nr});
+    f.configure_coro_nr({FLAGS_coro_nr});
+    // auto request_config =
+    //     bench::RequestGenerator::Config::make_default(0.8 /* put rate */,
+    //                                                   0.2 /* del rate */,
+    //                                                   8 /* key size */,
+    //                                                   64 /* value size */,
+    //                                                   total_cap /* key rng
+    //                                                   */);
+    bench::RequestGenerator::Config insert_config{
+        .put_get_del = {1.0, 0, 0},
+        .key_size_dist = {{8, 1.0}},
+        .value_size_dist =
+            {
+                // ETC workload
+                // tiny: (0.4)
+                {8, 0.2},
+                {16, 0.2},
+                // small (0.59)
+                {350, 0.59 / 4},
+                {700, 0.59 / 4},
+                {1050, 0.59 / 4},
+                {1400, 0.59 / 4},
+                // huge (0.01)
+                {205_KB, 0.01 / 5},
+                {410_KB, 0.01 / 5},
+                {615_KB, 0.01 / 5},
+                {840_KB, 0.01 / 5},
+                {1_MB, 0.01 / 5},
+            },
+        .z = 0,
+        .key_rng = total_cap,
+    };
+
+    auto client_nr = FLAGS_thread_nr * FLAGS_coro_nr * (FLAGS_machine_nr - 1);
+    size_t del_limit = (1.0 * total_cap / client_nr / 2);
+    LOG(INFO) << PRE(del_limit);
+    bench::RequestGenerator::Config del_config{
+        .put_get_del = {0, 0, 1},
+        .key_size_dist = {{8, 1.0}},
+        .value_size_dist =
+            {
+                {8, 1},
+            },
+        .z = 0,
+        .key_rng = total_cap,
+        .limit = del_limit,
+    };
+
+    CombineConfig insert_phase;
+    for (size_t i = 0; i < FLAGS_thread_nr; ++i)
+    {
+        insert_phase[i] = insert_config;
+    }
+    CombineConfig del_phase;
+    for (size_t i = 0; i < FLAGS_thread_nr; ++i)
+    {
+        if (i < FLAGS_thread_nr / 2)
+        {
+            del_phase[i] = del_config;
+        }
+        insert_phase[i] = insert_config;
+    }
+
+    avis::Config::ins().configure_fixed_bitmap_size(16_MB);
+    avis::Config::ins().configure_use_buddy_ge(2_MB);
+    avis::Config::ins().configure_share_bitmap(false);
+
+    avis::Config::ins().configure_ptl(false);
+    avis::Config::ins().configure_bp(false);
+    avis::Config::ins().configure_use_partition_allocator(false);
+
+    f.add_option<CombineConfig>(
+        "request_config",
+        {request_config, request_config_del_phase, request_config});
+    f.add_option<bool>("verbose", {true});
+    // f.add_option<bool>("enable_bp", {false});
+    // f.add_option<bool>("enable_ptl", {false});
+    // f.add_option<bool>("use_partition", {false});
+
+    exp.configure_monitor(1s, 60);
+    exp.launch_coroutines(f.generate_configs());
+
+    LOG(INFO) << pre_rh_explain<kE, kB, kS>{};
+
+    LOG(INFO) << "PASS.";
+}

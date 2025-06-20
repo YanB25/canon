@@ -1,0 +1,16 @@
+[submodule "thirdparty/DataFrame"]
+	path = thirdparty/DataFrame
+	url = git@git.tsinghua.edu.cn:yanb20/dataframe.git
+[submodule "thirdparty/jemalloc"]
+	path = thirdparty/jemalloc
+	url = https://github.com/jemalloc/jemalloc.git
+[submodule "thirdparty/range-v3"]
+	path = thirdparty/range-v3
+	url = https://github.com/ericniebler/range-v3
+	commit = 9aa41d6b8ded2cf5e8007e66a0efd1ab33dbf9a5
+[submodule "thirdparty/glog"]
+	path = thirdparty/glog
+	url = https://github.com/google/glog.git
+[submodule "thirdparty/cityhash"]
+	path = thirdparty/cityhash
+	url = https://github.com/google/cityhash.git
